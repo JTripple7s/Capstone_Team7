@@ -1,0 +1,11 @@
+build/
+install/
+log/
+__pycache__/
+.pyc/
+large_models/
+*/core
+*.pt
+app/app/core
+example/example/core
+*/core
