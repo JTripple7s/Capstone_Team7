@@ -1,0 +1,13 @@
+services:
+  ros_ws:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: capstone-team7:humble
+    container_name: capstone_team7
+    working_dir: /ws
+    volumes:
+      - ./:/ws
+    stdin_open: true
+    tty: true
+    command: bash
