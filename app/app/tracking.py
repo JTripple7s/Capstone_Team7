@@ -36,10 +36,6 @@ class ObjectTracker:
 
         self.set_status = set_status
         self.set_color = set_color
-        if color is not None:
-            self.target_lab, self.target_rgb = color
-        self.lab_data = yaml_handle.get_yaml_data(yaml_handle.lab_file_path)
-
         # 颜色RGB值定义
         self.range_rgb = {
             'red': (255, 0, 0),
@@ -48,6 +44,19 @@ class ObjectTracker:
             'black': (0, 0, 0),
             'white': (255, 255, 255),
         }
+
+        if color is not None:
+            self.target_lab, self.target_rgb = color
+
+        # LAB thresholds are optional in off-robot/dev environments.
+        # If the robot-specific file is missing, keep running and allow manual pick mode.
+        self.lab_data = {}
+        try:
+            self.lab_data = yaml_handle.get_yaml_data(yaml_handle.lab_file_path)
+        except Exception as e:
+            self.node.get_logger().warning(
+                f'LAB config load failed ({yaml_handle.lab_file_path}): {e}'
+            )
 
         self.threshold = 0.1  # 颜色检测阈值
 
@@ -106,6 +115,12 @@ class ObjectTracker:
                          int(self.target_lab[2] + 50 * threshold)]
             target_color = self.target_lab, min_color, max_color
         else:
+            if self.set_color not in self.lab_data:
+                # Avoid crashing when named-color mode is requested but LAB config is unavailable.
+                self.node.get_logger().warning(
+                    f"Color '{self.set_color}' not found in LAB config; skipping frame"
+                )
+                return result_image, None, 0
             min_color = [self.lab_data[self.set_color]['min'][0],
                          self.lab_data[self.set_color]['min'][1],
                          self.lab_data[self.set_color]['min'][2]]
@@ -609,10 +624,22 @@ class OjbectTrackingNode(Node):
         self.get_logger().info('\033[1;32m大模型设置目标颜色\033[0m')
         with self.lock:
             target_color_name = request.data.lower()
-            if target_color_name not in ObjectTracker(None, self, None, True).range_rgb:
+            # Build a probe tracker once to validate supported color names and loaded LAB data.
+            probe_tracker = ObjectTracker(None, self, None, True)
+            if target_color_name not in probe_tracker.range_rgb:
                 response.success = False
                 response.message = "无效颜色: '{}'. 有效颜色: {}".format(
-                    target_color_name, ", ".join(ObjectTracker(None, self, None, True).range_rgb.keys()))
+                    target_color_name, ", ".join(probe_tracker.range_rgb.keys()))
+                return response
+
+            if target_color_name not in probe_tracker.lab_data:
+                # Return a clear service error instead of crashing the node.
+                response.success = False
+                response.message = (
+                    "LAB配置缺失或未包含颜色 '{}', 请先使用 /object_tracking/set_target_color 取色".format(
+                        target_color_name
+                    )
+                )
                 return response
 
             self.tracker = ObjectTracker(None, self, target_color_name, True)
