@@ -30,6 +30,7 @@ setup(
             'network_camera_node = app.network_camera_node:main',
             'gesture_control_node = app.gesture_control_node:main',
             'avoidance_node = app.avoidance_node:main',
+            'yolov8_node = app.yolov8_node:main',
             #'hand_gesture = app.hand_gesture:main',
         ],
     },
