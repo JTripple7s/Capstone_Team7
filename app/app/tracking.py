@@ -33,6 +33,9 @@ class ObjectTracker:
         self.pro_size = (320, 240)  # 图像处理分辨率
         self.last_color_circle = None
         self.lost_target_count = 0
+        self.consecutive_hits = 0
+        self.is_locked = False
+        self.smoothed_circle = None
 
         self.set_status = set_status
         self.set_color = set_color
@@ -59,6 +62,12 @@ class ObjectTracker:
             )
 
         self.threshold = 0.1  # 颜色检测阈值
+        self.min_contour_area = 60
+        self.search_roi_radius = 90
+        self.max_jump_distance = 130
+        self.max_radius_ratio = 2.2
+        self.lock_confirm_frames = 2
+        self.smooth_alpha = 0.35
 
         # 云台PID参数
         self.servo_x_pid = pid.PID(P=0.25, I=0.05, D=0.009)
@@ -135,7 +144,8 @@ class ObjectTracker:
         dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
         contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[-2]
         contour_area = map(lambda c: (c, math.fabs(cv2.contourArea(c))), contours)
-        contour_area = list(filter(lambda c: c[1] > 40, contour_area))
+        # Stronger contour filtering to remove small noise blobs.
+        contour_area = list(filter(lambda c: c[1] > self.min_contour_area, contour_area))
         circle = None
         target_pos = None
         target_radius = 0
@@ -147,23 +157,53 @@ class ObjectTracker:
                 circle = cv2.minEnclosingCircle(contour)
             else:
                 (last_x, last_y), last_r = self.last_color_circle
+
+                # ROI-first selection: prefer candidates near the previous target.
+                local_candidates = []
+                for contour, area in contour_area:
+                    (cx, cy), cr = cv2.minEnclosingCircle(contour)
+                    if math.hypot(cx - last_x, cy - last_y) <= self.search_roi_radius:
+                        local_candidates.append((contour, area))
+                if len(local_candidates) > 0:
+                    contour_area = local_candidates
+
                 circles = map(lambda c: cv2.minEnclosingCircle(c[0]), contour_area)
                 circle_dist = list(map(lambda c: (c, math.sqrt(((c[0][0] - last_x) ** 2) + ((c[0][1] - last_y) ** 2))),
                                        circles))
                 circle, dist = min(circle_dist, key=lambda c: c[1])
-                if dist < 100:
-                    circle = circle
+
+                # Outlier rejection for sudden target jumps/size spikes.
+                radius_ratio = max(circle[1], last_r) / max(min(circle[1], last_r), 1.0)
+                if dist > self.max_jump_distance or radius_ratio > self.max_radius_ratio:
+                    circle = None
 
         # 如果检测到目标，绘制圆圈并更新位置
         if circle is not None:
             self.lost_target_count = 0
+            self.consecutive_hits += 1
             (x, y), r = circle
+
+            # Temporal smoothing to reduce jitter frame-to-frame.
+            if self.smoothed_circle is None:
+                sx, sy, sr = x, y, r
+            else:
+                sx = self.smooth_alpha * x + (1.0 - self.smooth_alpha) * self.smoothed_circle[0]
+                sy = self.smooth_alpha * y + (1.0 - self.smooth_alpha) * self.smoothed_circle[1]
+                sr = self.smooth_alpha * r + (1.0 - self.smooth_alpha) * self.smoothed_circle[2]
+            self.smoothed_circle = (sx, sy, sr)
+
+            # Lock confirmation: require a few consecutive hits before output.
+            if not self.is_locked and self.consecutive_hits < self.lock_confirm_frames:
+                return result_image, None, 0
+            self.is_locked = True
+
+            x, y, r = self.smoothed_circle
             x = x / self.pro_size[0] * w
             y = y / self.pro_size[1] * h
             r = r / self.pro_size[0] * w
             target_pos = (x, y)
             target_radius = r
-            self.last_color_circle = circle
+            self.last_color_circle = ((self.smoothed_circle[0], self.smoothed_circle[1]), self.smoothed_circle[2])
 
             if self.set_status == False:
                 result_image = cv2.circle(result_image, (int(x), int(y)), int(r), (self.target_rgb[0],
@@ -173,8 +213,11 @@ class ObjectTracker:
                 result_image = cv2.circle(result_image, (int(x), int(y)), int(r), self.range_rgb[self.set_color], 2)
         else:
             self.lost_target_count += 1
+            self.consecutive_hits = 0
             if self.lost_target_count > 10:
                 self.last_color_circle = None
+                self.smoothed_circle = None
+                self.is_locked = False
 
         return result_image, target_pos, target_radius
 
