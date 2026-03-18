@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['ball', 'goalpost']
+
+roboflow:
+  workspace: sergios-workspace-z9zic
+  project: ball-and-goalpost-detection-2-btfr3
+  version: 1
+  license: MIT
+  url: https://universe.roboflow.com/sergios-workspace-z9zic/ball-and-goalpost-detection-2-btfr3/dataset/1
