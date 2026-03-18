@@ -2,7 +2,7 @@ from ultralytics import YOLO
 import cv2
 
 # Load your trained model
-model = YOLO("models/best.pt")
+model = YOLO("app/app/model//best.pt")
 
 # Open webcam (0 = default Mac camera)
 cap = cv2.VideoCapture(0)
