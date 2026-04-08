@@ -8,7 +8,7 @@ Servo 2: Vertical movement
 port = serial.Serial("/dev/rrc", baudrate=1000000, timeout=5)
 port.rts = False
 port.dtr = False
-#port.open()
+port.open()
 
 crc8_table = [
     0, 94, 188, 226, 97, 63, 221, 131, 194, 156, 126, 32, 163, 253, 31, 65,
