@@ -27,6 +27,13 @@ Main ball tracking node with:
 - Direct serial motor control (tested and working)
 - All movement functions tuned through physical testing
 
+### `autonomous_soccer_striker.py`
+Autonomous scoring node that:
+- Detects ball and goalpost using YOLOv8
+- Implements a state machine: SEARCH_BALL -> APPROACH_BALL -> SEARCH_GOAL -> POSITIONING -> STRIKE
+- Uses Mecanum strafing to align Robot-Ball-Goal before striking
+- Automatically maneuvers to kick the ball into the goal
+
 ### Serial Communication
 ```
 Port: /dev/rrc
@@ -70,6 +77,7 @@ spin_90: speed=42, time=0.094s, 17 steps
 ## Usage
 
 ### On Robot (inside Docker)
+To run the **Ball Tracker** (camera tracking only or basic following):
 ```bash
 docker exec -it TurboPi bash
 source /opt/ros/humble/setup.bash
@@ -77,6 +85,26 @@ source /home/ubuntu/ros2_ws/install/setup.bash
 cd /home/ubuntu/ros2_ws/src/app/app
 python3 yolo_soccer_tracker.py
 ```
+
+To run the **Autonomous Soccer Striker** (finds ball and scores):
+```bash
+docker exec -it TurboPi bash
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+cd /home/ubuntu/ros2_ws/src/app/app
+python3 autonomous_soccer_striker.py
+```
+
+### Testing the Striker
+1. Place the ball anywhere in front of the robot.
+2. Ensure the goal is visible or within range for the robot to find while scanning.
+3. Run `autonomous_soccer_striker.py`.
+4. The robot should:
+   - Rotate camera to find ball.
+   - Drive to the ball and stop ~20cm away.
+   - Scan for the goal.
+   - Strafe left/right until the ball and goal are aligned.
+   - Dash forward to score.
 
 ### View Camera Stream
 ```
