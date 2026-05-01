@@ -19,7 +19,7 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '3')
 os.environ.setdefault('MKL_NUM_THREADS',      '3')
 
 # ============ CONFIG ============
-MODEL_PATH    = '/home/pi/V5_ncnn_model'   # V5 (Apr 29, newest) — yolov8n with robot+ball+goalpost classes
+MODEL_PATH    = '/home/pi/V6_ncnn_model'   # V6 (Apr 30) — partner's improved model, NCNN-converted from V6.pt
 YOLO_IMGSZ    = 320
 YOLO_CONF     = 0.10                            # very low base — let everything through, filter per-class below
 BALL_CONF     = 0.45                            # was 0.85 → 0.55 → 0.45. HSV + tiered persistence catch false positives at this threshold.
