@@ -22,15 +22,36 @@ os.environ.setdefault('MKL_NUM_THREADS',      '3')
 MODEL_PATH    = '/home/pi/V5_ncnn_model'   # V5 (Apr 29, newest) — yolov8n with robot+ball+goalpost classes
 YOLO_IMGSZ    = 320
 YOLO_CONF     = 0.10                            # very low base — let everything through, filter per-class below
-BALL_CONF     = 0.55                            # ball needs high confidence to chase
+BALL_CONF     = 0.80                            # very strict — false positives at 0.70
 GOAL_CONF     = 0.20                            # goalpost: lenient
-DEBUG_RENDER_ALL = True                         # render every detection with class label (diagnostic)
-NO_MOTORS        = True                         # SAFE MODE — servos still pan/tilt, but no wheel motors
+BALL_MIN_RADIUS_PX = 30                         # reject tiny ball blobs
+BALL_PERSIST_FRAMES = 3                         # require ball detected 3 frames in a row to trigger CARRYING
+CARRYING_LOST_BAIL_S = 2.0                      # if ball not seen for 2s while CARRYING, bail to HUNTING
+FIXED_TILT       = 1850                         # tilt during CARRYING (no sweep there)
+# 3 search tilt layers: low → mid → high (camera physically tilts up between layers)
+# Higher tilt # = camera looks DOWN. So layer 0 (2000) = closer/down, layer 2 (1700) = far/up.
+SEARCH_TILT_LEVELS = [2000, 1850, 1700]
+SEARCH_TURN_DURATION_S = 1.2                    # ~90° body rotation after all 3 layers scanned
+SEARCH_TURN_RATE       = 0.45                   # angular rate during TURN phase
+DEBUG_RENDER_ALL = False                        # OFF
+NO_MOTORS        = False                        # set True for SAFE MODE (servos only, no wheels)
 YOLO_EVERY_N  = 1
 BALL_TOP_MARGIN = 0.20                          # ignore detections in top 20% of frame (ceiling area)
 CAMERA_DEV    = '/dev/video0'
 CAM_W, CAM_H  = 640, 480
 MJPEG_PORT    = 8888
+
+# ============ Mission state machine (ball-to-goal) ============
+# Bot has front scoop (2 poles + curved cable cradle) — ball gets captured on contact.
+# So instead of STOPPING at the ball, we keep ball pinned in scoop while scanning for goal.
+CARRY_DIST_CM      = 12.0      # at this distance, ball is in the scoop -> CARRYING
+GOAL_SCAN_TILTS    = [1700, 1850, 2000]   # 3 layers: high, mid, low
+GOAL_SCAN_LAYER_S  = 1.5       # seconds per tilt layer
+GOAL_SCAN_TIMEOUT  = 12.0      # give up after this and return to HUNTING
+GOAL_CENTERED_PX   = 60        # |goal_ex| under this = centered enough to score
+PUSH_DURATION_S    = 2.5       # how long to drive forward in SCORING
+CARRY_FWD          = 0.50      # firm forward push to drive ball forward
+CARRY_TURN         = 0.0       # NO rotation during carry — was causing bot to spin in place
 
 FOCAL_LENGTH     = 474.0
 BALL_DIAMETER_MM = 40.0
@@ -183,6 +204,17 @@ class ZhuiYolo:
         self.goal_ttl = 0
         self.ball_smooth = None     # EMA-smoothed (cx, cy, r)
         self.goal_smooth = None     # EMA-smoothed (cx, cy, w, h)
+        # Mission state machine: HUNTING -> AT_BALL_SCAN -> ALIGNED -> SCORING -> HUNTING
+        self.mission = "HUNTING"
+        self.scan_start = 0.0
+        self.scan_dir   = 1          # body rotation direction during scan
+        self.score_start = 0.0
+        self.ball_persist = 0        # consecutive frames with ball detected (gate for CARRYING)
+        # Search sub-state: alternates between PAN (camera sweep) and TURN (body rotates 90°)
+        self.search_sub = 'PAN'
+        self.turn_start_time = 0.0
+        self.search_layer = 0          # current tilt layer (0 = low, 2 = high)
+        self.search_dir = -1           # start R→L (pan from high → low)
 
     def run_yolo(self, frame):
         fh, fw = frame.shape[:2]
@@ -233,6 +265,10 @@ class ZhuiYolo:
                         continue
                 if ratio < 0.6 or ratio > 1.6:
                     continue
+                # Size filter — reject tiny detections (most false positives are small)
+                radius_check = min(w, h) / 2.0
+                if radius_check < BALL_MIN_RADIUS_PX:
+                    continue
                 if a > best_ball_area:
                     radius = min(w, h) / 2.0
                     col = (0, 0, 255) if 'red' in str(name).lower() else (0, 255, 0)
@@ -268,11 +304,13 @@ class ZhuiYolo:
         if fresh_ball is not None:
             self.last_ball = fresh_ball
             self.ball_ttl = BALL_TTL
+            self.ball_persist += 1   # consecutive-frame counter for CARRYING gate
         elif self.ball_ttl > 0:
             self.ball_ttl -= 1
             # keep self.last_ball as-is for rendering / chase
         else:
             self.last_ball = None
+            self.ball_persist = 0    # reset persistence when ball truly lost
 
         # ----- Goal: TTL persistence only -----
         GOAL_TTL = 4
@@ -286,6 +324,79 @@ class ZhuiYolo:
 
         ball = self.last_ball
         goal = self.last_goal
+
+        # ============ MISSION STATE MACHINE ============
+        # Handle non-HUNTING states first; fall through to existing chase logic only in HUNTING.
+        handled = False
+
+        if self.mission == "CARRYING":
+            # Ball is in the front scoop. Just push forward in a straight line.
+            # Bail out if ball not seen for too long (false positive triggered CARRYING).
+            elapsed = time.time() - self.scan_start
+            if goal:
+                self.mission = "ALIGNED"
+            elif self.ball_ttl == 0 and elapsed > CARRYING_LOST_BAIL_S:
+                # Ball was lost — probably false positive. Bail back to HUNTING.
+                self.mission = "HUNTING"
+                stop_motors()
+            elif elapsed > GOAL_SCAN_TIMEOUT:
+                self.mission = "HUNTING"
+                stop_motors()
+            else:
+                # Lock camera straight ahead, just push forward
+                self.tilt = float(FIXED_TILT)
+                self.pan  = 1500.0
+                servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.1)
+                drive(CARRY_FWD, 0.0)   # straight forward, no rotation
+                cv2.putText(out, f"CARRYING t={elapsed:.1f}s",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            handled = True
+
+        elif self.mission == "ALIGNED":
+            if goal:
+                gx_off = goal['cx'] - fx
+                if abs(gx_off) < GOAL_CENTERED_PX:
+                    self.mission = "SCORING"
+                    self.score_start = time.time()
+                else:
+                    # Rotate while keeping gentle forward pressure (ball stays in scoop)
+                    ang = float(np.clip(gx_off * 0.005, -0.4, 0.4))
+                    drive(CARRY_FWD * 0.5, ang)
+                cv2.putText(out, f"ALIGN_GOAL ex={int(goal['cx']-fx):+d}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+            else:
+                # Lost goal during align — fall back to scan
+                self.mission = "CARRYING"
+                self.scan_start = time.time()
+            handled = True
+
+        elif self.mission == "SCORING":
+            elapsed = time.time() - self.score_start
+            if elapsed < PUSH_DURATION_S:
+                drive(1.0, 0.0)
+                cv2.putText(out, f"SCORING t={elapsed:.1f}/{PUSH_DURATION_S:.1f}s",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                stop_motors()
+                self.mission = "HUNTING"
+                self.lost = 0
+            handled = True
+
+        if handled:
+            # Render goal box during mission states so user can see detection
+            if goal:
+                gx1, gy1, gx2, gy2 = goal['box']
+                cv2.rectangle(out, (gx1, gy1), (gx2, gy2), (0, 255, 255), 2)
+                cv2.putText(out, f"GOAL {goal['conf']:.2f}",
+                            (gx1, max(gy1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (0, 255, 255), 2)
+            cv2.line(out, (fx-25, fy), (fx+25, fy), (0,0,255), 2)
+            cv2.line(out, (fx, fy-25), (fx, fy+25), (0,0,255), 2)
+            cv2.putText(out, f"pan={int(self.pan)} tilt={int(self.tilt)} st={self.mission}",
+                        (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+            with frame_lock:
+                latest_frame = out
+            return
 
         if ball:
             self.lost = 0
@@ -320,13 +431,26 @@ class ZhuiYolo:
             servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.08)
 
             cam_off = self.pan - 1500
-            ang = float(np.clip(cam_off * 0.002, -0.7, 0.7))
+            # Deadband: only rotate body if camera is significantly off-center.
+            # This prevents the bot from spinning when the camera makes small tracking adjustments.
+            if abs(cam_off) < 120:
+                ang = 0.0
+            else:
+                ang = float(np.clip(cam_off * 0.0012, -0.4, 0.4))   # gentler than 0.002
 
             d_cm = distance_cm(r)
-            if d_cm <= 5:
-                lin = 0.0;  st = "ARRIVED"
+            # Mission trigger: ball is now in the front scoop -> CARRYING
+            # Only trigger if ball has been detected for several consecutive frames
+            # (avoids false-positive flicker triggering the state).
+            if (d_cm <= CARRY_DIST_CM
+                and self.mission == "HUNTING"
+                and self.ball_persist >= BALL_PERSIST_FRAMES):
+                self.mission = "CARRYING"
+                self.scan_start = time.time()
+                self.scan_dir = 1 if (cx < fx) else -1
+                lin = CARRY_FWD; st = "CAPTURED"
             elif d_cm <= 12:
-                lin = 0.95; st = "TOUCH"     # 0.95 * 34 = 32% duty — breaks carpet friction
+                lin = 0.85; st = "TOUCH"     # slowed to avoid overshoot before capture
             elif d_cm <= 25:
                 lin = 0.95; st = "CLOSE"
             elif d_cm <= 45:
@@ -334,8 +458,9 @@ class ZhuiYolo:
             else:
                 lin = 1.0;  st = "CHASING"
 
-            if abs(ex) > 80:
-                lin *= 0.4
+            # Only slow forward if ball is REALLY off-center, and only modestly.
+            if abs(ex) > 150:
+                lin *= 0.7
 
             drive(lin, ang)
 
@@ -351,39 +476,53 @@ class ZhuiYolo:
             self.pan_i = 0; self.tilt_i = 0
             self.pan_last = 0; self.tilt_last = 0
             if self.lost > 5:
-                # SERPENTINE sweep: pan continues from where it ended at each tilt level.
-                # Tilt goes up through phases 0→1→2→3 (FLOOR→FAR), then reverses 3→2→1→0, repeat.
-                self.pan += self.search_dir * 25
-                hit_edge = False
-                if self.pan >= 2300:
-                    self.pan = 2300; self.search_dir = -1; hit_edge = True
-                elif self.pan <= 700:
-                    self.pan = 700; self.search_dir = 1; hit_edge = True
-                if hit_edge:
-                    # Step tilt in current vertical direction; reverse at top/bottom
-                    nxt = self.search_phase + self.tilt_dir
-                    if nxt > 3:
-                        self.tilt_dir = -1; nxt = self.search_phase + self.tilt_dir
-                    elif nxt < 0:
-                        self.tilt_dir = 1;  nxt = self.search_phase + self.tilt_dir
-                    self.search_phase = nxt
-                # 4 tilt levels: FLOOR → MID → FWD → FAR (for distant goalposts).
-                # Higher tilt number = camera looks DOWN; 1700 is the upper safety clip (no ceiling).
-                tgt = [2300, 2000, 1800, 1700][self.search_phase]
-                self.tilt += (tgt - self.tilt) * 0.1
-                servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.08)
-                # Body rotates in the same direction as pan — keeps scanning new headings.
-                if self.lost % 8 == 0:
-                    drive(0.0, self.search_dir * 0.15)
-                else:
+                # 3-layer × 4-quadrant scan:
+                # Within a quadrant: layer 0 R→L → step up → layer 1 L→R → step up → layer 2 R→L
+                # After all 3 layers: TURN body 90° → next quadrant
+                if self.search_sub == 'PAN':
+                    self.pan += self.search_dir * 35
+                    hit_edge = False
+                    if self.pan >= 2300:
+                        self.pan = 2300; hit_edge = True
+                    elif self.pan <= 700:
+                        self.pan = 700; hit_edge = True
+
+                    if hit_edge:
+                        if self.search_layer < 2:
+                            # Step up to next tilt layer, flip pan direction
+                            self.search_layer += 1
+                            self.search_dir *= -1
+                        else:
+                            # All 3 layers done — rotate body 90° to next quadrant
+                            self.search_sub = 'TURN'
+                            self.turn_start_time = time.time()
+                            self.search_layer = 0          # next quadrant starts at layer 0
+                            self.search_dir *= -1          # flip dir for layer 0 of next quadrant
+
+                    target_tilt = SEARCH_TILT_LEVELS[self.search_layer]
+                    self.tilt += (target_tilt - self.tilt) * 0.30
+                    servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.08)
                     stop_motors()
+                else:   # 'TURN'
+                    elapsed = time.time() - self.turn_start_time
+                    if elapsed >= SEARCH_TURN_DURATION_S:
+                        self.search_sub = 'PAN'
+                        stop_motors()
+                    else:
+                        drive(0.0, SEARCH_TURN_RATE)
+                    target_tilt = SEARCH_TILT_LEVELS[0]
+                    self.tilt += (target_tilt - self.tilt) * 0.30
+                    servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.08)
             else:
                 stop_motors()
 
-            names = ["FLOOR", "MID", "FWD", "FAR"]
-            arrow = '>' if self.search_dir > 0 else '<'
-            vert  = '^' if self.tilt_dir  > 0 else 'v'
-            cv2.putText(out, f"SEARCHING {names[self.search_phase]} pan{arrow} tilt{vert}",
+            if self.search_sub == 'PAN':
+                arrow = '>' if self.search_dir > 0 else '<'
+                label = f"SEARCHING L{self.search_layer+1}/3 pan{arrow}"
+            else:
+                t_remain = SEARCH_TURN_DURATION_S - (time.time() - self.turn_start_time)
+                label = f"TURNING ~90deg ({t_remain:.1f}s)"
+            cv2.putText(out, label,
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         # ===== DEBUG: render ball + goalpost detections (no Robot-car) =====
