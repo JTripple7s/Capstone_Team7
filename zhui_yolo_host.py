@@ -1,70 +1,114 @@
 #!/usr/bin/env python3
-"""zhui_yolo_host.py — Kevin's zhui_yolo.py adapted to run on host (no ROS, no docker).
-Same ball-chase logic, NCNN backend, no goal-seeking, pulsed rotation during search.
-
-Source: /home/pi/zhui_yolo.py (Kevin's pre-friend tracker)
-Changes: ROS Image subscriber → cv2.VideoCapture; path → /home/pi/Bestv2_ncnn_model
 """
-import os, sys, time, struct, threading, subprocess, signal
-import http.server, socketserver
-import numpy as np
-import cv2
-import serial
+yolo_live.py — V7 YOLO + LOCKED CAMERA tracker.
 
-# Offline mode + thread caps
-os.environ['YOLO_OFFLINE']     = '1'
-os.environ['YOLO_AUTOINSTALL'] = 'False'
-os.environ.setdefault('OMP_NUM_THREADS',      '3')
-os.environ.setdefault('OPENBLAS_NUM_THREADS', '3')
-os.environ.setdefault('MKL_NUM_THREADS',      '3')
+Camera is FIXED (pan=1500, tilt=1800). Body rotates to keep ball centered in
+frame, then drives forward. Camera never moves during operation. This eliminates
+camera-vs-body misalignment and bang-bang oscillation.
+
+State machine:
+  WAIT (no ball) -> stop motors
+  WARMUP -> ball just appeared, building persistence
+  CHASE_ROT -> ball off center, pulse-rotate body to bring ball to center
+  CHASE_FWD -> ball centered, drive forward (speed scales with distance)
+  HOLD -> ball in scoop, no goal seen
+  AIM -> ball in scoop + goal seen, pulse-rotate to align goal behind ball
+  AT_GOAL -> aimed, but goal bbox is wide (bot is close to goal). Stop, ball already there.
+  SCORE -> aimed, goal not too close, full forward push (SCORE_DURATION_S)
+
+Stream: http://<pi-ip>:8888/
+"""
+import cv2, time, threading, signal, subprocess, struct
+import numpy as np
+import serial
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socket as _socket
+from ultralytics import YOLO
 
 # ============ CONFIG ============
-MODEL_PATH    = '/home/pi/V6_ncnn_model'   # V6 (Apr 30) — partner's improved model, NCNN-converted from V6.pt
-YOLO_IMGSZ    = 320
-YOLO_CONF     = 0.10                            # very low base — let everything through, filter per-class below
-BALL_CONF     = 0.45                            # was 0.85 → 0.55 → 0.45. HSV + tiered persistence catch false positives at this threshold.
-GOAL_CONF     = 0.20                            # goalpost: lenient
-BALL_MIN_RADIUS_PX = 18                         # was 35 — too strict, missed far balls. Tiered persistence below handles false-positive risk.
-BALL_PERSIST_FRAMES = 3                         # frames needed before CARRYING transition
-CHASE_PERSIST_FRAMES = 3                        # base frames for close balls; far balls require more (see ball_actionable below)
-BALL_MAX_JUMP_PX = 180                          # reject ball detection that teleports between frames
-BALL_PERSIST_FAR_FRAMES = 8                     # tiered: small/far balls (radius < BALL_RADIUS_FAR_THRESHOLD) need more frames
-BALL_RADIUS_FAR_THRESHOLD = 25                  # below this radius, treat as "far ball" → stricter persistence
-CARRYING_LOST_BAIL_S = 2.0                      # if ball not seen for 2s while CARRYING, bail to HUNTING
-FIXED_TILT       = 1850                         # tilt during CARRYING (no sweep there)
-# 3 search tilt layers: low → mid → high (camera physically tilts up between layers)
-# Higher tilt # = camera looks DOWN. So layer 0 (2000) = closer/down, layer 2 (1700) = far/up.
-SEARCH_TILT_LEVELS = [2000, 1850, 1700]
-SEARCH_TURN_DURATION_S = 1.6                    # ~90° at 18% duty (slower duty needs longer time)
-SEARCH_TURN_RATE       = 0.65                   # angular rate during TURN phase (carpet)
-DEBUG_RENDER_ALL = False                        # OFF
-NO_MOTORS        = False                        # set True for SAFE MODE (servos only, no wheels)
-YOLO_EVERY_N  = 1
-BALL_TOP_MARGIN = 0.20                          # ignore detections in top 20% of frame (ceiling area)
-CAMERA_DEV    = '/dev/video0'
-CAM_W, CAM_H  = 640, 480
-MJPEG_PORT    = 8888
+MODEL_PATH    = "/home/pi/best_ncnn_model"
+CAM_INDEX     = 0
+WIDTH, HEIGHT = 640, 480
+STREAM_PORT   = 8888
+CONF          = 0.35    # lowered to catch goalpost detections at distance (model is conservative on goal class)
 
-# ============ Mission state machine (ball-to-goal) ============
-# Bot has front scoop (2 poles + curved cable cradle) — ball gets captured on contact.
-# So instead of STOPPING at the ball, we keep ball pinned in scoop while scanning for goal.
-CARRY_DIST_CM      = 12.0      # at this distance, ball is in the scoop -> CARRYING
-GOAL_SCAN_TILTS    = [1700, 1850, 2000]   # 3 layers: high, mid, low
-GOAL_SCAN_LAYER_S  = 1.5       # seconds per tilt layer
-GOAL_SCAN_TIMEOUT  = 12.0      # give up after this and return to HUNTING
-GOAL_CENTERED_PX   = 60        # |goal_ex| under this = centered enough to score
-PUSH_DURATION_S    = 2.5       # how long to drive forward in SCORING
-CARRY_FWD          = 0.50      # firm forward push to drive ball forward
-CARRY_TURN         = 0.0       # NO rotation during carry — was causing bot to spin in place
+# Camera positions — dynamic tilt: FAR for chase+goal sighting, CLOSE for confirming ball in scoop
+CAM_PAN_FIXED  = 1596     # calibrated — pan stays locked
+CAM_TILT_FAR   = 1770     # default — sees ball + goal (tuned 2026-05-04)
+CAM_TILT_CLOSE = 1770     # locked to FAR — looking down loses the upright goalpost from frame
+CAM_TILT_FIXED = CAM_TILT_FAR  # back-compat for overlay/init
+TILT_NEAR_CM   = 22.0     # at FAR: switch to CLOSE when ball ≤ this
+TILT_FAR_CM    = 38.0     # at CLOSE: switch back to FAR when ball > this (or ball lost)
+TILT_DEBOUNCE_S = 0.5     # min interval between tilt switches
 
+# Detection stability
+EMA_ALPHA      = 0.55     # ball-position smoothing
+BALL_PERSIST_N = 3        # consecutive frames before PID/body acts
+BALL_TTL_N     = 20       # ~3.3s @ 6 FPS — keep last ball through brief occlusions (goal mesh, motion blur)
+
+# Distance estimate (vision, calibrated for 40mm ball + this camera)
 FOCAL_LENGTH     = 474.0
 BALL_DIAMETER_MM = 40.0
+def distance_cm(r):
+    return 0.0 if r <= 0 else (BALL_DIAMETER_MM * FOCAL_LENGTH) / (r * 2) / 10.0
 
-def distance_cm(radius):
-    if radius <= 0: return 0
-    return (BALL_DIAMETER_MM * FOCAL_LENGTH) / (radius * 2) / 10.0
+# Motor safety
+NO_MOTORS         = False  # SAFE: True = wheels disabled. False = bot drives.
+FWD_DUTY          = 28.0   # tuned for fresh battery (high torque) — was 36 for tired battery
+TURN_DUTY         = 18.0   # gentler curving
+MAX_DUTY          = 40.0
+TURN_IN_PLACE_DTY = 26.0   # gentler in-place pivots; fresh battery still breaks stiction
 
-# ============ Serial protocol (same as zhui_yolo.py) ============
+# Body rotation pulses (long enough to overcome carpet stiction, short enough to avoid overshoot)
+BODY_ROT_PULSE_S = 0.06    # smaller kick = smaller overshoot on carpet
+BODY_ROT_STOP_S  = 0.28    # longer settle = YOLO sees more frames before next correction
+
+# Forward drive pulses (controlled increments so YOLO can keep up with closing distance)
+FWD_PULSE_S = 0.15         # drive forward this long
+FWD_STOP_S  = 0.15         # then stop and let YOLO update (~2-3 frames at 20 FPS)
+
+# State machine thresholds
+BALL_CENTER_TIGHT = 80     # rotate->forward transition: commit when ball is "approximately" centered
+BALL_CENTER_LOOSE = 280    # forward->rotate transition: stay in curving CHASE_FWD until ball drifts past frame edge
+SCOOP_DIST_CM     = 12.0
+SCOOP_CENTER_TOL  = 130    # ball must be within 130px of frame center to count as "in scoop" (i.e. at bot's mouth)
+AIM_TOL_PX        = 100    # very generous — commit to SCORE early, avoid rotation oscillation
+GOAL_CLOSE_W_PX   = 9999   # disabled: goal-width based AT_GOAL stop. Bot will AIM + SCORE instead.
+SCORE_DURATION_S  = 0.9    # longer push so ball actually goes INTO goal mouth (not just bumps it)
+SLOWDOWN_ERR_PX   = 250    # disabled in practice: bot transitions to CHASE_ROT at LOOSE=220 before this fires
+AIM_DRIVE_LIN     = 0.55   # need higher than chase since FWD_DUTY=28 means 0.55*28=15.4 (one side ~32% — breaks stiction)
+AIM_DRIVE_ANG     = 0.95   # paired with above to keep one side ~zero, other side ~32% (clean pivot+forward)
+
+# ============ Ball recovery / back-up ============
+# When the bot loses sight of the ball (e.g. drove past it / overshot), it FIRST stops and
+# waits briefly — sometimes YOLO just missed a frame or two. If the ball is still missing
+# after BACKUP_AFTER_LOST_S seconds, the bot drives slowly in REVERSE (camera stays locked
+# forward) so the ball comes back into the camera's view in front of the bot. Reverse stops
+# as soon as the ball is re-detected. Gives up after BACKUP_TIMEOUT_S.
+BACKUP_AFTER_LOST_S = 1.5    # seconds in WAIT before reverse kicks in
+BACKUP_TIMEOUT_S    = 4.0    # give up reversing after this long; sit in WAIT
+BACKUP_LIN          = -0.55  # reverse speed (matches AIM_DRIVE_LIN magnitude — gentle but breaks stiction)
+
+# ============ SCAN-360 (long-range ball search) ============
+# After BACKUP gives up and the bot has been totally still for SCAN_AFTER_LOST_S,
+# rotate ~45° in place, then SETTLE looking for the ball, repeat up to 8 times for
+# a full 360° sweep. First rotation is biased toward last-known goal direction so
+# the bot covers the play area before sweeping into open space.
+SCAN_AFTER_LOST_S   = 10.0   # seconds after ball loss before SCAN starts (covers 5.5s of WAIT/BACKUP + 4.5s pause)
+SCAN_SETTLE_S       = 4.5    # seconds to sit still between rotations watching for ball
+SCAN_ROT_S          = 0.75   # ~45° continuous rotation @ TURN_IN_PLACE_DTY=26 on carpet (calibrate live)
+SCAN_MAX_SEGMENTS   = 16     # 16 × 45° = 720° (two full sweeps) before giving up
+SCAN_GOAL_MEMORY_S  = 90.0   # extend goal memory while scanning (default is 4s) so AIM still works after ball reacquired
+
+# ============ HOLD-SCAN (goal search while carrying ball) ============
+# When bot has ball in scoop but goal isn't visible, rotate in place ~45° increments
+# (ball stays in the scoop while rotating) until goal is seen → AIM/SCORE.
+HOLD_SCAN_AFTER_S    = 2.0   # seconds of HOLD without goal before rotation kicks in
+HOLD_SCAN_SETTLE_S   = 3.0   # seconds to sit still between rotations watching for goal
+HOLD_SCAN_ROT_S      = 0.55  # ~45° continuous rotation while holding ball
+HOLD_SCAN_MAX_SEGS   = 8     # 8 × 45° = 360° before giving up
+
+# ============ Serial / CRC8 ============
 CRC8 = [
     0,94,188,226,97,63,221,131,194,156,126,32,163,253,31,65,157,195,33,127,252,162,64,30,
     95,1,227,189,62,96,130,220,35,125,159,193,66,28,254,160,225,191,93,3,128,222,60,98,
@@ -81,16 +125,16 @@ CRC8 = [
 try:
     SERIAL_PORT = serial.Serial("/dev/rrc", baudrate=1000000, timeout=5)
     SERIAL_PORT.rts = False; SERIAL_PORT.dtr = False
+    print("[serial] /dev/rrc opened")
 except Exception as e:
-    print(f"[warn] serial open failed: {e}", flush=True)
+    print(f"[warn] serial open failed: {e}")
     SERIAL_PORT = None
 
 def _send(func, data):
     if SERIAL_PORT is None: return
     buf = [0xAA, 0x55, func, len(data)] + list(data)
     c = 0
-    for b in buf[2:]:
-        c = CRC8[c ^ b]
+    for b in buf[2:]: c = CRC8[c ^ b]
     buf.append(c & 0xFF)
     try: SERIAL_PORT.write(bytes(buf))
     except Exception: pass
@@ -108,691 +152,634 @@ def motor_duty(duties):
         data.extend(struct.pack("<Bf", int(mid - 1), float(v)))
     _send(3, data)
 
-_last_drive_time = [0.0]
-_last_drive_cmd  = [(0.0, 0.0)]
+def stop_motors():
+    motor_duty([[1, 0], [2, 0], [3, 0], [4, 0]])
 
+_last_drive = [0.0, (0.0, 0.0)]
 def drive(linear_x, angular_z):
-    """Tuned for carpet — needs >=30% duty to overcome static friction."""
-    if NO_MOTORS:
-        return
-    FWD_DUTY  = 20.0   # slow pace — was 34 for carpet, then 24, now 20 for smooth hardwood
-    TURN_DUTY = 14.0
-    MAX_ANY   = 24.0
+    if NO_MOTORS: return
     now = time.time()
     cmd = (round(linear_x, 2), round(angular_z, 2))
-    if now - _last_drive_time[0] < 0.2 and cmd == _last_drive_cmd[0]:
+    if now - _last_drive[0] < 0.2 and cmd == _last_drive[1]:
         return
-    _last_drive_time[0] = now
-    _last_drive_cmd[0] = cmd
-    fwd = np.clip(linear_x,  -1.0, 1.0) * FWD_DUTY
-    tur = np.clip(angular_z, -1.0, 1.0) * TURN_DUTY
+    _last_drive[0] = now; _last_drive[1] = cmd
+    fwd = float(np.clip(linear_x,  -1.0, 1.0)) * FWD_DUTY
+    tur = float(np.clip(angular_z, -1.0, 1.0)) * TURN_DUTY
     m1 = -fwd + tur
     m2 =  fwd + tur
     m3 = -fwd + tur
     m4 =  fwd + tur
-    clamp = lambda v: float(max(-MAX_ANY, min(MAX_ANY, v)))
+    clamp = lambda v: float(max(-MAX_DUTY, min(MAX_DUTY, v)))
     motor_duty([[1, clamp(m1)], [2, clamp(m2)], [3, clamp(m3)], [4, clamp(m4)]])
 
-def stop_motors():
-    motor_duty([[1, 0], [2, 0], [3, 0], [4, 0]])
-
-def turn_in_place(direction):
-    """Pure-rotation. Reduced duty for hardwood — was 32% for carpet.
-    direction = +1 for clockwise, -1 for counter-clockwise.
-    """
-    if NO_MOTORS:
-        return
-    duty = 18.0 * direction   # slowed: was 32 carpet → 22 → 18 hardwood
-    motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
-
-# ============ HSV green-ball verifier (rejects YOLO false positives) ============
-# Tennis-ball / green-ball hue ~ 35-85 (OpenCV HSV: H 0-179).
-GREEN_HSV_LO = np.array([30,  60,  60], dtype=np.uint8)
-GREEN_HSV_HI = np.array([85, 255, 255], dtype=np.uint8)
-GREEN_FRAC_MIN = 0.18   # >=18% of bbox must be green to accept
-
-def is_green_ball(frame, box):
-    x1, y1, x2, y2 = box
-    h, w = frame.shape[:2]
-    x1 = max(0, x1); y1 = max(0, y1)
-    x2 = min(w, x2); y2 = min(h, y2)
-    if x2 <= x1 or y2 <= y1:
-        return False, 0.0
-    crop = frame[y1:y2, x1:x2]
-    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, GREEN_HSV_LO, GREEN_HSV_HI)
-    frac = float(mask.mean()) / 255.0
-    return (frac >= GREEN_FRAC_MIN), frac
-
-# ============ MJPEG server ============
-latest_frame = None
-frame_lock = threading.Lock()
-
-class MJPEGHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a, **k): pass
-    def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b'<html><body style="margin:0;background:#000">'
-                             b'<img src="/video" style="width:100%"></body></html>')
-        elif self.path == '/video':
-            self.send_response(200)
-            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            try:
-                while True:
-                    with frame_lock:
-                        f = latest_frame
-                    if f is not None:
-                        ok, jpg = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                        if ok:
-                            self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                                             + jpg.tobytes() + b'\r\n')
-                    time.sleep(0.033)
-            except Exception:
-                pass
+# Pulsed body rotation — very short pulses so each commit is small (3-5 deg per pulse)
+_body_rot_phase = 'STOP'
+_body_rot_phase_start = 0.0
+def body_rot_pulsed(direction):
+    """Pulse-rotate. direction: +1 = CCW (left), -1 = CW (right). Caller invokes every loop."""
+    if NO_MOTORS: return
+    global _body_rot_phase, _body_rot_phase_start
+    now = time.time()
+    elapsed = now - _body_rot_phase_start
+    if _body_rot_phase == 'ROTATE':
+        if elapsed >= BODY_ROT_PULSE_S:
+            _body_rot_phase = 'STOP'; _body_rot_phase_start = now
+            stop_motors()
         else:
-            self.send_error(404)
-
-class ReusableTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-def start_mjpeg(port=MJPEG_PORT):
-    srv = ReusableTCPServer(("", port), MJPEGHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-
-# ============ Tracker ============
-class ZhuiYolo:
-    def __init__(self, model):
-        self.model = model
-        # Accept any class with 'ball' in name. If none, fall back to all.
-        self.ball_class_ids = set(
-            cid for cid, n in self.model.names.items() if 'ball' in str(n).lower()
-        )
-        if not self.ball_class_ids:
-            self.ball_class_ids = set(self.model.names.keys())
-        print(f"[tracker] ball class ids: {self.ball_class_ids}", flush=True)
-
-        self.pan  = 1500.0
-        self.tilt = 1800.0
-        self.pan_i = 0.0;  self.tilt_i = 0.0
-        self.pan_last = 0.0; self.tilt_last = 0.0
-        # PID gains — slowed from 0.25/0.05/0.009 for smoother camera tracking.
-        self.Kp, self.Ki, self.Kd = 0.15, 0.03, 0.006
-        servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.5)
-
-        self.search_dir = 1     # pan direction: +1 = left→right, -1 = right→left
-        self.search_phase = 0   # tilt level index
-        self.tilt_dir = 1       # tilt direction: +1 = phase++ (going UP visually), -1 = going DOWN
-        self.lost = 0
-        self.frame_counter = 0
-        self.last_ball = None
-        self.last_goal = None
-        # Stability state: TTL (keep last detection for a few miss-frames) + EMA smoothing
-        self.ball_ttl = 0
-        self.goal_ttl = 0
-        self.ball_smooth = None     # EMA-smoothed (cx, cy, r)
-        self.goal_smooth = None     # EMA-smoothed (cx, cy, w, h)
-        # Mission state machine: HUNTING -> AT_BALL_SCAN -> ALIGNED -> SCORING -> HUNTING
-        self.mission = "HUNTING"
-        self.scan_start = 0.0
-        self.scan_dir   = 1          # body rotation direction during scan
-        self.score_start = 0.0
-        self.ball_persist = 0        # consecutive frames with ball detected (gate for CARRYING)
-        # Search sub-state: alternates between PAN (camera sweep) and TURN (body rotates 90°)
-        self.search_sub = 'PAN'
-        self.turn_start_time = 0.0
-        self.search_layer = 0          # current tilt layer (0 = low, 2 = high)
-        self.search_dir = -1           # start R→L (pan from high → low)
-        # Goalpost bearing memory: remember which side we last saw the goal (left/right).
-        # Used in CARRYING when goal not visible — bias rotation toward last-known direction.
-        self.last_goal_seen_t = 0.0
-        self.last_goal_side  = 0       # -1 = left, +1 = right, 0 = unknown
-        # Reject-reason diagnostic: log every N seconds when raw ball detections were rejected.
-        self.last_reject_log_t = 0.0
-        self.last_ball_raw = 0
-        self.last_ball_reject = {}
-
-    def run_yolo(self, frame):
-        fh, fw = frame.shape[:2]
-        results = self.model.predict(frame, imgsz=YOLO_IMGSZ, conf=YOLO_CONF,
-                                     verbose=False, device='cpu')
-        if not results:
-            return None, None
-        r = results[0]
-        if r.boxes is None or len(r.boxes) == 0:
-            return None, None
-        best_ball = None; best_ball_area = 0
-        best_goal = None; best_goal_area = 0
-        # Debug: count what model returns per class (helps diagnose "model never sees goalpost")
-        cls_count = {}
-        all_detections = []  # for debug-render-all
-        # Diagnostic: count why ball candidates got rejected (helps tune filters)
-        ball_reject = {'conf': 0, 'top': 0, 'selfmask': 0, 'ratio': 0, 'radius': 0, 'hsv': 0}
-        ball_raw    = 0  # how many raw ball detections the model produced (any conf)
-        for box in r.boxes:
-            c = int(box.cls[0])
-            cls_count[c] = cls_count.get(c, 0) + 1
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            all_detections.append({
-                'cls': c, 'name': self.model.names[c],
-                'box': (int(x1), int(y1), int(x2), int(y2)),
-                'conf': float(box.conf[0]),
-            })
-        self.last_cls_count = cls_count
-        self.last_all = all_detections
-        self.last_ball_raw = ball_raw
-        self.last_ball_reject = ball_reject
-        for box in r.boxes:
-            cls = int(box.cls[0])
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            w = x2 - x1; h = y2 - y1
-            a = w * h
-            if a < 100: continue
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            ratio = w / h if h > 0 else 0
-            name = self.model.names[cls]
-
-            conf = float(box.conf[0])
-            if cls in self.ball_class_ids:
-                ball_raw += 1
-                if conf < BALL_CONF:
-                    ball_reject['conf'] += 1; continue
-                # ball-specific filters
-                if cy < fh * BALL_TOP_MARGIN:
-                    ball_reject['top'] += 1; continue
-                # ROBOT SELF-MASK: bottom-left + bottom-right corners (own wheels).
-                # Tightened to corners only (fw*0.15 / 0.85) so balls in normal-bottom area aren't rejected.
-                if cy > fh * 0.85:
-                    if cx < fw * 0.15 or cx > fw * 0.85:
-                        ball_reject['selfmask'] += 1; continue
-                if ratio < 0.5 or ratio > 1.8:
-                    ball_reject['ratio'] += 1; continue
-                # Size filter — reject tiny detections (most false positives are small)
-                radius_check = min(w, h) / 2.0
-                if radius_check < BALL_MIN_RADIUS_PX:
-                    ball_reject['radius'] += 1; continue
-                # HSV green-color verifier: rejects YOLO false positives that aren't actually green.
-                ok_green, gfrac = is_green_ball(frame, (int(x1), int(y1), int(x2), int(y2)))
-                if not ok_green:
-                    ball_reject['hsv'] += 1; continue
-                if a > best_ball_area:
-                    radius = min(w, h) / 2.0
-                    col = (0, 0, 255) if 'red' in str(name).lower() else (0, 255, 0)
-                    best_ball = {'cx':cx, 'cy':cy, 'r':radius, 'a':a, 'name':name.upper(),
-                                 'col':col, 'conf': conf, 'gfrac': gfrac,
-                                 'box': (int(x1), int(y1), int(x2), int(y2))}
-                    best_ball_area = a
-            elif 'goal' in name.lower():
-                if conf < GOAL_CONF:
-                    continue
-                # goalpost: pick LARGEST detection (closest goalpost dominates)
-                if a > best_goal_area:
-                    best_goal = {'cx':cx, 'cy':cy, 'w':w, 'h':h, 'a':a, 'name':name.upper(),
-                                 'conf': conf, 'ratio': ratio,
-                                 'box': (int(x1), int(y1), int(x2), int(y2))}
-                    best_goal_area = a
-        return best_ball, best_goal
-
-    def step(self, frame):
-        global latest_frame
-        h, w = frame.shape[:2]
-        fx, fy = w // 2, h // 2
-        out = frame.copy()
-
-        self.frame_counter += 1
-        if self.frame_counter % YOLO_EVERY_N == 0:
-            fresh_ball, fresh_goal = self.run_yolo(frame)
+            duty = TURN_IN_PLACE_DTY * direction
+            motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
+    else:  # STOP
+        if elapsed >= BODY_ROT_STOP_S:
+            _body_rot_phase = 'ROTATE'; _body_rot_phase_start = now
+            duty = TURN_IN_PLACE_DTY * direction
+            motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
         else:
-            fresh_ball = fresh_goal = None
+            stop_motors()
 
-        # ----- Ball: TTL persistence + position consistency check -----
-        BALL_TTL = 8        # ~1.25s at 6.4fps — bridges short YOLO drop-outs from motion blur
-        if fresh_ball is not None:
-            jumped = False
-            if self.last_ball is not None and self.ball_ttl > 0:
-                dx = fresh_ball['cx'] - self.last_ball['cx']
-                dy = fresh_ball['cy'] - self.last_ball['cy']
-                jump_dist = (dx*dx + dy*dy) ** 0.5
-                if jump_dist > BALL_MAX_JUMP_PX:
-                    jumped = True
-                    print(f"[ball] REJECT JUMP {jump_dist:.0f}px (was {self.last_ball['cx']:.0f},{self.last_ball['cy']:.0f} -> {fresh_ball['cx']:.0f},{fresh_ball['cy']:.0f}) conf={fresh_ball['conf']:.2f}", flush=True)
-                    self.ball_persist = 0
-            if not jumped:
-                # EWMA smoothing on (cx, cy, r) — reduces jitter in chase + cuts JUMP rejects.
-                a = 0.35   # 0.35 new + 0.65 old
-                if self.ball_smooth is None:
-                    self.ball_smooth = (fresh_ball['cx'], fresh_ball['cy'], fresh_ball['r'])
-                else:
-                    self.ball_smooth = (
-                        a * fresh_ball['cx'] + (1 - a) * self.ball_smooth[0],
-                        a * fresh_ball['cy'] + (1 - a) * self.ball_smooth[1],
-                        a * fresh_ball['r']  + (1 - a) * self.ball_smooth[2],
-                    )
-                fresh_ball['cx'] = self.ball_smooth[0]
-                fresh_ball['cy'] = self.ball_smooth[1]
-                fresh_ball['r']  = self.ball_smooth[2]
-                # Log first detection (acquiring) and chase trigger
-                if self.last_ball is None:
-                    print(f"[ball] ACQUIRE conf={fresh_ball['conf']:.2f} r={fresh_ball['r']:.0f} pos=({fresh_ball['cx']:.0f},{fresh_ball['cy']:.0f}) gfrac={fresh_ball.get('gfrac', 0):.2f}", flush=True)
-                self.last_ball = fresh_ball
-                self.ball_ttl = BALL_TTL
-                self.ball_persist += 1
-                # Tiered: far balls (small radius) need more persistence frames before chasing.
-                needed = BALL_PERSIST_FAR_FRAMES if fresh_ball['r'] < BALL_RADIUS_FAR_THRESHOLD else CHASE_PERSIST_FRAMES
-                if self.ball_persist == needed:
-                    print(f"[ball] CHASE-OK persist={self.ball_persist}/{needed} (r={fresh_ball['r']:.0f}) conf={fresh_ball['conf']:.2f}", flush=True)
-            else:
-                if self.ball_ttl > 0:
-                    self.ball_ttl -= 1
-        elif self.ball_ttl > 0:
-            self.ball_ttl -= 1
+def reset_body_rot_phase():
+    global _body_rot_phase, _body_rot_phase_start
+    _body_rot_phase = 'STOP'
+    _body_rot_phase_start = time.time()
+
+# Pulsed forward drive — drive briefly, stop briefly, repeat. Lets YOLO keep up with closing distance.
+_fwd_phase = 'STOP'
+_fwd_phase_start = 0.0
+def chase_fwd_pulsed(lin, ang=0.0):
+    """Pulsed forward drive with optional angular curve toward ball. Caller invokes every loop iter."""
+    if NO_MOTORS: return
+    global _fwd_phase, _fwd_phase_start
+    now = time.time()
+    elapsed = now - _fwd_phase_start
+    if _fwd_phase == 'DRIVE':
+        if elapsed >= FWD_PULSE_S:
+            _fwd_phase = 'STOP'; _fwd_phase_start = now
+            stop_motors()
         else:
-            if self.last_ball is not None:
-                print(f"[ball] LOST (had persist={self.ball_persist})", flush=True)
-            self.last_ball = None
-            self.ball_persist = 0
-            self.ball_smooth = None
-
-        # ----- Goal: TTL persistence only -----
-        GOAL_TTL = 4
-        if fresh_goal is not None:
-            self.last_goal = fresh_goal
-            self.goal_ttl = GOAL_TTL
-            # Memory: remember which side the goal was on, so CARRYING can bias rotation.
-            self.last_goal_seen_t = time.time()
-            self.last_goal_side  = -1 if fresh_goal['cx'] < (frame.shape[1] / 2.0) else 1
-        elif self.goal_ttl > 0:
-            self.goal_ttl -= 1
-        else:
-            self.last_goal = None
-
-        # Reject diagnostic: if model saw raw ball detections but ALL got filtered, log the reasons.
-        # Throttled to every 3 seconds so we don't spam.
-        if (fresh_ball is None
-            and getattr(self, 'last_ball_raw', 0) > 0
-            and time.time() - self.last_reject_log_t > 3.0):
-            rj = self.last_ball_reject
-            print(f"[ball-reject] raw={self.last_ball_raw} reasons: {rj}", flush=True)
-            self.last_reject_log_t = time.time()
-
-        ball = self.last_ball
-        goal = self.last_goal
-        # Anti-flicker: only "act" on ball after persistence threshold reached.
-        # TIERED: far balls (small radius) require BALL_PERSIST_FAR_FRAMES, close balls require CHASE_PERSIST_FRAMES.
-        if ball is not None:
-            needed = BALL_PERSIST_FAR_FRAMES if ball['r'] < BALL_RADIUS_FAR_THRESHOLD else CHASE_PERSIST_FRAMES
-            ball_actionable = self.ball_persist >= needed
-        else:
-            ball_actionable = False
-
-        # ============ MISSION STATE MACHINE ============
-        # Handle non-HUNTING states first; fall through to existing chase logic only in HUNTING.
-        handled = False
-
-        if self.mission == "CARRYING":
-            # Ball is in the front scoop. Just push forward in a straight line.
-            # Bail out if ball not seen for too long (false positive triggered CARRYING).
-            elapsed = time.time() - self.scan_start
-            # Escape detection: ball clearly visible but small (escaped the scoop).
-            # 50 px radius ~= 19 cm — definitely not in scoop. Bail to HUNTING.
-            ball_escaped = ball_actionable and ball['r'] < 50 and elapsed > 1.0
-            if goal:
-                self.mission = "ALIGNED"
-            elif ball_escaped:
-                print(f"[mission] CARRYING bail: ball escaped scoop (r={ball['r']:.0f}, t={elapsed:.1f}s)", flush=True)
-                self.mission = "HUNTING"
-                stop_motors()
-            elif self.ball_ttl == 0 and elapsed > CARRYING_LOST_BAIL_S:
-                # Ball was lost — probably false positive. Bail back to HUNTING.
-                self.mission = "HUNTING"
-                stop_motors()
-            elif elapsed > GOAL_SCAN_TIMEOUT:
-                self.mission = "HUNTING"
-                stop_motors()
-            else:
-                # Lock camera straight ahead, just push forward
-                self.tilt = float(FIXED_TILT)
-                self.pan  = 1500.0
-                servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.1)
-                # If we saw the goal recently, bias rotation toward last-known side while pushing.
-                # This avoids the full 4-quadrant scan when we already know roughly where the goal is.
-                t_since_goal = time.time() - self.last_goal_seen_t
-                if t_since_goal < 8.0 and self.last_goal_side != 0:
-                    ang = 0.18 * self.last_goal_side    # gentle bias, ball stays in scoop
-                    drive(CARRY_FWD * 0.7, ang)
-                    cv2.putText(out, f"CARRYING t={elapsed:.1f}s GMEM={'R' if self.last_goal_side > 0 else 'L'} ({t_since_goal:.1f}s ago)",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
-                else:
-                    drive(CARRY_FWD, 0.0)               # straight forward, no rotation
-                    cv2.putText(out, f"CARRYING t={elapsed:.1f}s",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-            handled = True
-
-        elif self.mission == "ALIGNED":
-            if goal:
-                gx_off = goal['cx'] - fx
-                if abs(gx_off) < GOAL_CENTERED_PX:
-                    self.mission = "SCORING"
-                    self.score_start = time.time()
-                else:
-                    # Rotate while keeping gentle forward pressure (ball stays in scoop)
-                    ang = float(np.clip(gx_off * 0.005, -0.4, 0.4))
-                    drive(CARRY_FWD * 0.5, ang)
-                cv2.putText(out, f"ALIGN_GOAL ex={int(goal['cx']-fx):+d}",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
-            else:
-                # Lost goal during align — fall back to scan
-                self.mission = "CARRYING"
-                self.scan_start = time.time()
-            handled = True
-
-        elif self.mission == "SCORING":
-            elapsed = time.time() - self.score_start
-            if elapsed < PUSH_DURATION_S:
-                drive(1.0, 0.0)
-                cv2.putText(out, f"SCORING t={elapsed:.1f}/{PUSH_DURATION_S:.1f}s",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            else:
-                stop_motors()
-                self.mission = "HUNTING"
-                self.lost = 0
-            handled = True
-
-        if handled:
-            # Render goal box during mission states so user can see detection
-            if goal:
-                gx1, gy1, gx2, gy2 = goal['box']
-                cv2.rectangle(out, (gx1, gy1), (gx2, gy2), (0, 255, 255), 2)
-                cv2.putText(out, f"GOAL {goal['conf']:.2f}",
-                            (gx1, max(gy1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                            (0, 255, 255), 2)
-            cv2.line(out, (fx-25, fy), (fx+25, fy), (0,0,255), 2)
-            cv2.line(out, (fx, fy-25), (fx, fy+25), (0,0,255), 2)
-            cv2.putText(out, f"pan={int(self.pan)} tilt={int(self.tilt)} st={self.mission}",
-                        (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
-            with frame_lock:
-                latest_frame = out
-            return
-
-        if ball_actionable:
-            self.lost = 0
-            cx, cy, r = ball['cx'], ball['cy'], ball['r']
-            ex = cx - fx
-            ey = cy - fy
-
-            DEAD = 12
-            MAX_STEP = 25           # was 50 — capped lower for smoother camera motion
-            ERR_CLAMP = 160         # cap pixel error fed into PID (lost-and-reacquire transients)
-            ex_c = float(np.clip(ex, -ERR_CLAMP, ERR_CLAMP))
-            ey_c = float(np.clip(ey, -ERR_CLAMP, ERR_CLAMP))
-            if abs(ex) > DEAD:
-                self.pan_i = float(np.clip(self.pan_i + ex_c, -500, 500))
-                d = ex_c - self.pan_last; self.pan_last = ex_c
-                step = self.Kp*ex_c + self.Ki*self.pan_i + self.Kd*d
-                step = float(np.clip(step, -MAX_STEP, MAX_STEP))
-                self.pan -= step
-            else:
-                self.pan_i = 0; self.pan_last = 0
-            if abs(ey) > DEAD:
-                self.tilt_i = float(np.clip(self.tilt_i + ey_c, -500, 500))
-                d = ey_c - self.tilt_last; self.tilt_last = ey_c
-                step = (self.Kp*ey_c + self.Ki*self.tilt_i + self.Kd*d) * 0.7
-                step = float(np.clip(step, -MAX_STEP, MAX_STEP))
-                self.tilt += step
-            else:
-                self.tilt_i = 0; self.tilt_last = 0
-
-            self.pan  = float(np.clip(self.pan,  500, 2500))
-            self.tilt = float(np.clip(self.tilt, 1700, 2500))   # don't let camera look up at ceiling
-            servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.18)
-
-            # ===== DECOUPLED BODY STEERING =====
-            # Body rotation derives from BALL position in frame (ex), NOT camera servo position.
-            # Coupling body to camera caused a feedback oscillation: camera PID swings → body spins →
-            # ball moves in frame → camera over-corrects → body spins back → bot wobbles around ball.
-            # Now: camera tracks ball independently, body steers directly toward ball center.
-            BODY_DEADBAND_PX = 80
-            if abs(ex) < BODY_DEADBAND_PX:
-                ang = 0.0
-            else:
-                # Sign matches original: cam_off had opposite sign from ex (since pan -= step), so we negate.
-                ang = float(np.clip(-ex * 0.0010, -0.25, 0.25))   # gentle, no overshoot
-
-            d_cm = distance_cm(r)
-            # Mission trigger: ball is now in the front scoop -> CARRYING
-            # Only trigger if ball has been detected for several consecutive frames
-            # (avoids false-positive flicker triggering the state).
-            if (d_cm <= CARRY_DIST_CM
-                and self.mission == "HUNTING"
-                and self.ball_persist >= BALL_PERSIST_FRAMES):
-                self.mission = "CARRYING"
-                self.scan_start = time.time()
-                self.scan_dir = 1 if (cx < fx) else -1
-                lin = CARRY_FWD; st = "CAPTURED"
-            elif d_cm <= 12:
-                lin = 0.85; st = "TOUCH"     # slowed to avoid overshoot before capture
-            elif d_cm <= 25:
-                lin = 0.95; st = "CLOSE"
-            elif d_cm <= 45:
-                lin = 1.0;  st = "APPROACH"
-            else:
-                lin = 1.0;  st = "CHASING"
-
-            # Only slow forward if ball is REALLY off-center, and only modestly.
-            if abs(ex) > 150:
-                lin *= 0.7
-
             drive(lin, ang)
-
-            cv2.circle(out, (int(cx), int(cy)), int(r), ball['col'], 2)
-            cv2.circle(out, (int(cx), int(cy)), 4, ball['col'], -1)
-            cv2.line(out, (fx, fy), (int(cx), int(cy)), (255,255,0), 1)
-            cv2.putText(out, f"{ball['name']} {st} d={d_cm:.0f}cm {ball['conf']:.2f}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ball['col'], 2)
-            cv2.putText(out, f"r={int(r)} err=({int(ex)},{int(ey)})",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ball['col'], 1)
+    else:  # STOP
+        if elapsed >= FWD_STOP_S:
+            _fwd_phase = 'DRIVE'; _fwd_phase_start = now
+            drive(lin, ang)
         else:
-            self.lost += 1
-            self.pan_i = 0; self.tilt_i = 0
-            self.pan_last = 0; self.tilt_last = 0
-            if self.lost > 5:
-                # 3-layer × 4-quadrant scan:
-                # Within a quadrant: layer 0 R→L → step up → layer 1 L→R → step up → layer 2 R→L
-                # After all 3 layers: TURN body 90° → next quadrant
-                if self.search_sub == 'PAN':
-                    self.pan += self.search_dir * 14   # was 35 — too fast (224 px/sec). 14 → ~90 px/sec.
-                    hit_edge = False
-                    if self.pan >= 2300:
-                        self.pan = 2300; hit_edge = True
-                    elif self.pan <= 700:
-                        self.pan = 700; hit_edge = True
+            stop_motors()
 
-                    if hit_edge:
-                        if self.search_layer < 2:
-                            self.search_layer += 1
-                            self.search_dir *= -1
-                            print(f"[search] layer {self.search_layer+1}/3", flush=True)
-                        else:
-                            self.search_sub = 'TURN'
-                            self.turn_start_time = time.time()
-                            self.search_layer = 0
-                            self.search_dir *= -1
-                            print(f"[search] TURN start (~90deg, {SEARCH_TURN_DURATION_S}s @ rate {SEARCH_TURN_RATE})", flush=True)
+def reset_fwd_phase():
+    global _fwd_phase, _fwd_phase_start
+    _fwd_phase = 'STOP'
+    _fwd_phase_start = time.time()
 
-                    target_tilt = SEARCH_TILT_LEVELS[self.search_layer]
-                    self.tilt += (target_tilt - self.tilt) * 0.12   # was 0.30 — smoother layer change
-                    servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.20)   # was 0.08 — gentler servo
-                    stop_motors()
-                else:   # 'TURN'
-                    elapsed = time.time() - self.turn_start_time
-                    if elapsed >= SEARCH_TURN_DURATION_S:
-                        self.search_sub = 'PAN'
-                        stop_motors()
-                        print(f"[search] TURN done (rotated {elapsed:.2f}s)", flush=True)
-                    else:
-                        # Use dedicated high-duty turn — drive() can't break carpet friction
-                        turn_in_place(1)
-                    target_tilt = SEARCH_TILT_LEVELS[0]
-                    self.tilt += (target_tilt - self.tilt) * 0.12   # smoother
-                    servo_write([[1, int(self.tilt)], [2, int(self.pan)]], 0.20)   # gentler
-            else:
-                stop_motors()
 
-            if self.search_sub == 'PAN':
-                arrow = '>' if self.search_dir > 0 else '<'
-                label = f"SEARCHING L{self.search_layer+1}/3 pan{arrow}"
-            else:
-                t_remain = SEARCH_TURN_DURATION_S - (time.time() - self.turn_start_time)
-                label = f"TURNING ~90deg ({t_remain:.1f}s)"
-            cv2.putText(out, label,
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+# ============ camera + model ============
+print(f"loading model: {MODEL_PATH}")
+model = YOLO(MODEL_PATH, task="detect")
+print("model loaded")
 
-        # ===== DEBUG: render ball + goalpost detections (no Robot-car) =====
-        if DEBUG_RENDER_ALL:
-            for d in getattr(self, 'last_all', []):
-                if d['cls'] == 0:           # skip Robot-car — not used for tracking
-                    continue
-                if d['cls'] == 1 and d['conf'] < BALL_CONF:
-                    continue                 # skip junk low-conf ball boxes
-                if d['cls'] == 2 and d['conf'] < GOAL_CONF:
-                    continue                 # skip junk low-conf goalpost boxes
-                bx1, by1, bx2, by2 = d['box']
-                col = (0, 255, 0) if d['cls'] == 1 else (0, 255, 255)
-                cv2.rectangle(out, (bx1, by1), (bx2, by2), col, 1)
-                cv2.putText(out, f"{d['name']} {d['conf']:.2f}",
-                            (bx1, max(by1 - 4, 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+cap = cv2.VideoCapture(CAM_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+# minimize capture-side latency: 1-frame V4L2 buffer + MJPG input fourcc
+# (without these, cap.read() returns the OLDEST buffered frame, which adds
+# 200-400ms of pipeline lag in front of our inference time)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+try:
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+except Exception:
+    pass
+if not cap.isOpened():
+    print("ERROR: camera"); raise SystemExit(1)
+for _ in range(8): cap.read()
 
-        # ===== GOALPOST visualization (no behavior change yet — just analyze) =====
-        if goal:
-            gx1, gy1, gx2, gy2 = goal['box']
-            # yellow box for goalpost
-            cv2.rectangle(out, (gx1, gy1), (gx2, gy2), (0, 255, 255), 2)
-            cv2.putText(out, f"GOAL {goal['conf']:.2f} ar={goal['ratio']:.2f}",
-                        (gx1, max(gy1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        (0, 255, 255), 2)
-            # angular offset of goalpost from frame center (would be used for striker/goalie aim)
-            g_ex = goal['cx'] - fx
-            cv2.putText(out, f"goal_ex={int(g_ex):+d} w={int(goal['w'])} h={int(goal['h'])}",
-                        (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        else:
-            # Show what the model DID see (helps diagnose "no goalpost ever")
-            cc = getattr(self, 'last_cls_count', {}) or {}
-            cls_names = {0: 'robot', 1: 'ball', 2: 'goal'}
-            summary = ' '.join(f"{cls_names.get(k,k)}:{v}" for k, v in cc.items()) or 'none'
-            cv2.putText(out, f"no goalpost (model sees: {summary})",
-                        (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
+# Set initial camera position — pan locked, tilt is dynamic (FAR by default)
+stop_motors()
+servo_write([[1, CAM_TILT_FAR], [2, CAM_PAN_FIXED]], 0.5)
+time.sleep(0.6)
+print(f"[servo] init pan={CAM_PAN_FIXED} tilt={CAM_TILT_FAR} (FAR)")
+print(f"[motors] {'DISARMED' if NO_MOTORS else 'ARMED'}")
 
-        cv2.line(out, (fx-25, fy), (fx+25, fy), (0,0,255), 2)
-        cv2.line(out, (fx, fy-25), (fx, fy+25), (0,0,255), 2)
-        cv2.putText(out, f"pan={int(self.pan)} tilt={int(self.tilt)}",
-                    (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+# ============ stability state ============
+last_ball       = None    # (cx, cy, w, h) smoothed + persistent
+_lost_since_t   = 0.0     # time we entered WAIT (used to decide when BACKUP kicks in)
+_backup_started_t = 0.0   # time BACKUP mode actually started (for BACKUP_TIMEOUT_S)
+# SCAN-360 state (for ball loss)
+_scan_started_t      = 0.0   # time SCAN first entered (resets on ball reacquire)
+_scan_segment_idx    = 0     # 0..SCAN_MAX_SEGMENTS; FULL_LOST when >= 8
+_scan_phase_start_t  = 0.0   # time current ROTATE/SETTLE phase began
+_scan_phase          = 'SETTLE'  # 'ROTATE' | 'SETTLE' — start in SETTLE so we look first
+_scan_dir            = +1    # set on entry from last goal_x sign
 
-        with frame_lock:
-            latest_frame = out
+# HOLD-SCAN state (for goal search while ball is in scoop)
+_hold_scan_started_t   = 0.0
+_hold_scan_segment_idx = 0
+_hold_scan_phase_start_t = 0.0
+_hold_scan_phase       = 'SETTLE'
+_hold_scan_dir         = +1
+ball_smooth     = None    # (cx, cy)
+ball_persist    = 0
+ball_ttl        = 0
+chase_rotating  = True    # hysteresis: True = currently in CHASE_ROT
+score_started_t = 0.0
 
-# ============ Main ============
-_loop = True
-def _shutdown(*_):
-    global _loop
-    print("[shutdown] stopping", flush=True)
-    _loop = False
+# Dynamic tilt state — camera dips down when ball is close so it doesn't drop out of frame
+_cam_state      = "FAR"   # "FAR" or "CLOSE"
+_cam_switch_t   = 0.0
+_last_goal_x    = None    # remembered from last FAR view; used when at CLOSE (goal not visible)
+_last_goal_w    = 0       # remembered goal bbox width — for goal_close check at CLOSE tilt
+_last_goal_seen_t = 0.0
+def update_cam_tilt(ball_dist_cm, ball_seen_now):
+    """Switch tilt between FAR and CLOSE based on ball proximity. Debounced."""
+    global _cam_state, _cam_switch_t
+    now = time.time()
+    if now - _cam_switch_t < TILT_DEBOUNCE_S:
+        return
+    if _cam_state == "FAR":
+        if ball_seen_now and ball_dist_cm <= TILT_NEAR_CM:
+            _cam_state = "CLOSE"; _cam_switch_t = now
+            stop_motors()  # halt during tilt — verify scoop before resuming
+            servo_write([[1, CAM_TILT_CLOSE], [2, CAM_PAN_FIXED]], 0.2)
+            print(f"[cam] FAR→CLOSE (ball at {ball_dist_cm:.1f}cm) — verifying scoop")
+    else:  # CLOSE
+        # leave CLOSE when ball gets far again, OR ball lost for >2s (re-acquire from FAR)
+        if (ball_seen_now and ball_dist_cm > TILT_FAR_CM) or (not ball_seen_now and (now - _cam_switch_t) > 2.0):
+            _cam_state = "FAR"; _cam_switch_t = now
+            stop_motors()
+            servo_write([[1, CAM_TILT_FAR], [2, CAM_PAN_FIXED]], 0.2)
+            print(f"[cam] CLOSE→FAR")
+
+# ============ stream + sys stats ============
+state_pub = {"frame": None, "frame_id": 0, "fps": 0.0, "running": True,
+             "temp": "?", "volts": "?", "throttled": "0x0"}
+lock = threading.Lock()
+
+CLASS_COLORS = {0: (0, 255, 0), 1: (0, 165, 255)}
+CLASS_NAMES  = {0: "ball", 1: "goalpost"}
+
+def handle_sigint(sig, frm):
+    print("[sigint] stopping")
+    state_pub["running"] = False
     try: stop_motors()
     except Exception: pass
+    try: servo_write([[1, 1500], [2, 1500]], 0.5)
+    except Exception: pass
+signal.signal(signal.SIGINT,  handle_sigint)
+signal.signal(signal.SIGTERM, handle_sigint)
 
-def read_throttled():
-    """Returns (raw_int, human_str). Raw 0x0 = healthy.
-    Bit 0 = under-voltage NOW, bit 16 = under-voltage HAS OCCURRED since boot.
-    """
-    try:
-        r = subprocess.run(['vcgencmd', 'get_throttled'], capture_output=True, text=True, timeout=2)
-        out = r.stdout.strip()             # "throttled=0x0"
-        val = int(out.split('=')[1], 16)
-        flags = []
-        if val & 0x1:     flags.append("UNDERVOLT-NOW")
-        if val & 0x2:     flags.append("FREQ-CAPPED-NOW")
-        if val & 0x4:     flags.append("THROTTLED-NOW")
-        if val & 0x8:     flags.append("TEMP-LIMIT-NOW")
-        if val & 0x10000: flags.append("undervolt-since-boot")
-        if val & 0x20000: flags.append("freq-capped-since-boot")
-        if val & 0x40000: flags.append("throttled-since-boot")
-        if val & 0x80000: flags.append("temp-limit-since-boot")
-        return val, (",".join(flags) if flags else "healthy")
-    except Exception as e:
-        return None, f"vcgencmd-failed:{e}"
+def poll_stats():
+    while state_pub["running"]:
+        try:
+            t  = subprocess.check_output(["vcgencmd","measure_temp"],         text=True).strip()
+            v  = subprocess.check_output(["vcgencmd","measure_volts","core"], text=True).strip()
+            th = subprocess.check_output(["vcgencmd","get_throttled"],        text=True).strip()
+            state_pub["temp"]      = t.split("=")[1] if "=" in t else "?"
+            state_pub["volts"]     = v.split("=")[1] if "=" in v else "?"
+            state_pub["throttled"] = th.split("=")[1] if "=" in th else "?"
+        except Exception:
+            pass
+        time.sleep(2.0)
+threading.Thread(target=poll_stats, daemon=True).start()
 
-def startup_checklist():
-    print("=" * 60, flush=True)
-    print("[boot] STARTUP CHECKLIST:", flush=True)
-    print("[boot]   * battery voltage > 7.4V? (full ~8.4V, brown-out at ~6.5V)", flush=True)
-    print("[boot]   * /dev/rrc -> ttyAMA0 (NOT ttyS0)? motors won't talk on ttyS0", flush=True)
-    print("[boot]   * carpet vs hardwood? carpet needs >=30% duty to break friction", flush=True)
-    val, flags = read_throttled()
-    if val is None:
-        print(f"[boot]   * throttle status: UNAVAILABLE ({flags})", flush=True)
-    elif val == 0:
-        print(f"[boot]   * throttle status: healthy (0x0)", flush=True)
-    else:
-        print(f"[boot]   * throttle status: WARNING 0x{val:x} = {flags}", flush=True)
-        print(f"[boot]     ^ previous brown-out detected — battery likely sagged. Check/charge before long runs.", flush=True)
-    print("=" * 60, flush=True)
+class StreamHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a, **k): pass
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200); self.send_header("Content-Type","text/html"); self.end_headers()
+            self.wfile.write(b'<html><body style="background:#111;color:#fff;font-family:monospace;text-align:center">'
+                             b'<h2>YOLO striker - LOCKED CAMERA</h2><img src="/stream"/></body></html>'); return
+        if self.path != "/stream":
+            self.send_response(404); self.end_headers(); return
+        # low-latency stream: TCP_NODELAY + tiny send buffer so old frames are dropped
+        # by the kernel rather than queued, and per-frame deduplication so we never
+        # encode/transmit the same frame twice.
+        try:
+            self.connection.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, 65536)
+        except OSError:
+            pass
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        last_id = -1
+        try:
+            while state_pub["running"]:
+                with lock:
+                    fid = state_pub["frame_id"]
+                    f = None if state_pub["frame"] is None or fid == last_id else state_pub["frame"]
+                if f is None:
+                    time.sleep(0.01); continue
+                last_id = fid
+                ok, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                if not ok: continue
+                try:
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-def main():
-    signal.signal(signal.SIGINT,  _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+def serve():
+    HTTPServer(("0.0.0.0", STREAM_PORT), StreamHandler).serve_forever()
+threading.Thread(target=serve, daemon=True).start()
+print(f"streaming: http://<pi-ip>:{STREAM_PORT}/")
 
-    startup_checklist()
+# ============ main loop ============
+fcx = WIDTH // 2; fcy = HEIGHT // 2
+t_last, frames, fps_acc = time.time(), 0, 0.0
+mot_state = "INIT"
 
-    subprocess.run(['fuser', '-k', f'{MJPEG_PORT}/tcp'], capture_output=True)
-    time.sleep(0.3)
-    start_mjpeg(MJPEG_PORT)
-    print(f"[mjpeg] http://192.168.2.2:{MJPEG_PORT}", flush=True)
-
-    cap = cv2.VideoCapture(CAMERA_DEV, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-    if not cap.isOpened():
-        print(f"[fatal] cannot open {CAMERA_DEV}", flush=True)
-        sys.exit(1)
-
-    print(f"[init] loading model: {MODEL_PATH}", flush=True)
-    from ultralytics import YOLO
-    model = YOLO(MODEL_PATH, task='detect')
-    print(f"[init] classes: {model.names}", flush=True)
-
-    tracker = ZhuiYolo(model)
-
-    t_log = time.time(); fps_n = 0
-    t_throttle = time.time()
-    last_throttle_val = 0
-    while _loop:
+try:
+    while state_pub["running"]:
+        # drain any frames the V4L2 driver buffered while we were doing inference,
+        # then keep the most recent one — costs ~1-2ms and removes pipeline lag
+        cap.grab(); cap.grab()
         ok, frame = cap.read()
         if not ok:
-            time.sleep(0.01); continue
-        fps_n += 1
-        tracker.step(frame)
-        if time.time() - t_log > 5.0:
-            print(f"[loop] fps={fps_n/5.0:.1f}", flush=True)
-            fps_n = 0; t_log = time.time()
-        # Throttle/brown-out watcher: log when status changes (catches battery sag before reboot).
-        if time.time() - t_throttle > 10.0:
-            val, flags = read_throttled()
-            if val is not None and val != last_throttle_val:
-                print(f"[power] throttle 0x{val:x} = {flags}", flush=True)
-                if val & 0x1:
-                    print(f"[power] !!! UNDER-VOLTAGE NOW — battery sagging, brown-out imminent. Stop motors & charge.", flush=True)
-                last_throttle_val = val
-            t_throttle = time.time()
+            time.sleep(0.02); continue
 
+        t0 = time.time()
+        res = model.predict(frame, imgsz=640, conf=CONF, verbose=False, device="cpu")[0]
+        infer_ms = (time.time() - t0) * 1000
+
+        # ----- detect ball + goal -----
+        best_ball = None; best_ball_a = 0
+        best_goal = None; best_goal_a = 0
+        best_goal_clipped = False
+        n_ball = n_goal = 0
+        EDGE_MARGIN = 10  # px: bbox touching this close to a frame edge is "clipped"
+        fw_full = frame.shape[1]
+        for box in res.boxes:
+            cls = int(box.cls[0]); conf = float(box.conf[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            w = x2 - x1; h = y2 - y1; a = w * h
+            cx = (x1 + x2) / 2.0; cy = (y1 + y2) / 2.0
+            color = CLASS_COLORS.get(cls, (255,255,255))
+            cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+            cv2.putText(frame, f"{CLASS_NAMES.get(cls,'?')} {conf:.2f}", (x1, max(20, y1-8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.circle(frame, (int(cx), int(cy)), 6, color, -1)
+            cv2.circle(frame, (int(cx), int(cy)), 8, (255,255,255), 1)
+            cv2.line(frame, (int(cx), y1), (int(cx), y2), color, 1)
+            if cls == 0:
+                n_ball += 1
+                if a > best_ball_a:
+                    best_ball = (cx, cy, w, h); best_ball_a = a
+            elif cls == 1:
+                n_goal += 1
+                if a > best_goal_a:
+                    best_goal = (cx, cy, w, h); best_goal_a = a
+                    best_goal_clipped = (x1 <= EDGE_MARGIN) or (x2 >= fw_full - EDGE_MARGIN)
+        # mark clipped goal bbox visually so user can see when goal_x is unreliable
+        if best_goal is not None and best_goal_clipped:
+            cv2.putText(frame, "GOAL CLIPPED", (int(best_goal[0])-90, int(best_goal[1])-20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        # ----- EMA smoothing + persistence + TTL on ball -----
+        if best_ball is not None:
+            fcx_raw, fcy_raw, fw, fh = best_ball
+            if ball_smooth is None:
+                ball_smooth = (fcx_raw, fcy_raw)
+            else:
+                ball_smooth = (
+                    EMA_ALPHA * fcx_raw + (1 - EMA_ALPHA) * ball_smooth[0],
+                    EMA_ALPHA * fcy_raw + (1 - EMA_ALPHA) * ball_smooth[1],
+                )
+            last_ball    = (ball_smooth[0], ball_smooth[1], fw, fh)
+            ball_ttl     = BALL_TTL_N
+            ball_persist = min(ball_persist + 1, BALL_PERSIST_N + 5)
+        elif ball_ttl > 0:
+            ball_ttl -= 1
+        else:
+            last_ball    = None
+            ball_smooth  = None
+            ball_persist = 0
+
+        ball_actionable = (last_ball is not None) and (ball_persist >= BALL_PERSIST_N)
+
+        # ----- remember goal X+W (any cam state) but ONLY when bbox is fully in frame -----
+        # When the goal bbox is clipped at a frame edge its center is biased toward the visible
+        # half, so we don't trust it for memory or aim — keep using the last unclipped read.
+        if best_goal is not None and not best_goal_clipped:
+            _last_goal_x = float(best_goal[0])
+            _last_goal_w = int(best_goal[2])
+            _last_goal_seen_t = time.time()
+
+        # ----- update camera tilt based on ball distance -----
+        if last_ball is not None:
+            _ball_radius_px_for_tilt = min(last_ball[2], last_ball[3]) / 2.0
+            update_cam_tilt(distance_cm(_ball_radius_px_for_tilt), best_ball is not None)
+        else:
+            update_cam_tilt(999.0, False)
+
+        # ===== STATE MACHINE (dynamic tilt) =====
+        # During the first 0.4s after a tilt change, motors stay STOPPED so YOLO can
+        # re-acquire the ball at the new tilt before any drive/rotate decisions.
+        tilt_settling = (time.time() - _cam_switch_t) < 0.4
+
+        # Pre-compute goal_close from any source we have (live or remembered)
+        _goal_seen_now_for_safety = best_goal is not None
+        if _goal_seen_now_for_safety:
+            _safety_goal_w = int(best_goal[2])
+        elif _last_goal_x is not None and (time.time() - _last_goal_seen_t) < 2.0:
+            _safety_goal_w = int(_last_goal_w)
+        else:
+            _safety_goal_w = 0
+
+        if NO_MOTORS:
+            mot_state = "DISARMED"
+            mot_color = (128, 128, 128)
+            stop_motors()       # safety: zero motors every loop in disarmed mode
+        elif tilt_settling:
+            mot_state = f"VERIFY ({_cam_state.lower()})"
+            mot_color = (200, 200, 0)
+            reset_body_rot_phase(); reset_fwd_phase()
+            stop_motors()
+        elif _safety_goal_w > GOAL_CLOSE_W_PX:
+            # SAFETY: goal is huge in frame — bot is at/inside the goal. Stop unconditionally.
+            mot_state = "AT_GOAL"; mot_color = (0, 220, 0)
+            reset_body_rot_phase(); reset_fwd_phase()
+            stop_motors()
+        elif not ball_actionable:
+            now = time.time()
+            if last_ball is not None:
+                # ball seen recently but persistence not yet built — wait for it to settle
+                mot_state = "WARMUP"
+                mot_color = (200, 200, 0)
+                reset_body_rot_phase(); reset_fwd_phase()
+                stop_motors()
+                _lost_since_t = 0.0; _backup_started_t = 0.0
+            else:
+                # ball completely lost. Brief WAIT, then drive in REVERSE so the ball
+                # comes back into the camera's view (camera is locked forward; if we
+                # overshot the ball it's now behind us).
+                if _lost_since_t == 0.0:
+                    _lost_since_t = now
+                lost_for = now - _lost_since_t
+                if lost_for < BACKUP_AFTER_LOST_S:
+                    # short pause — sometimes YOLO just dropped a frame, don't reverse instantly
+                    mot_state = "WAIT"
+                    mot_color = (200, 200, 0)
+                    reset_body_rot_phase(); reset_fwd_phase()
+                    stop_motors()
+                elif lost_for < SCAN_AFTER_LOST_S:
+                    # within BACKUP window or short pause after BACKUP timed out
+                    if _backup_started_t == 0.0:
+                        _backup_started_t = now
+                    if (now - _backup_started_t) > BACKUP_TIMEOUT_S:
+                        # BACKUP gave up — quiet pause until SCAN_AFTER_LOST_S
+                        mot_state = "WAIT (gave up)"
+                        mot_color = (180, 100, 100)
+                        reset_body_rot_phase(); reset_fwd_phase()
+                        stop_motors()
+                    else:
+                        mot_state = f"BACKUP ({_fwd_phase.lower()})"
+                        mot_color = (0, 200, 255)
+                        reset_body_rot_phase()
+                        chase_fwd_pulsed(BACKUP_LIN, 0.0)   # negative lin = reverse
+                else:
+                    # SCAN-360: rotate ~45° then look ~10s, repeat for full circle
+                    if _scan_started_t == 0.0:
+                        _scan_started_t = now
+                        _scan_phase_start_t = now
+                        _scan_phase = 'SETTLE'
+                        _scan_segment_idx = 0
+                        # bias direction toward last known goal — rotate toward where action was
+                        if _last_goal_x is not None:
+                            _scan_dir = +1 if _last_goal_x < fcx else -1
+                        else:
+                            _scan_dir = +1
+                        reset_body_rot_phase(); reset_fwd_phase()
+                    if _scan_segment_idx >= SCAN_MAX_SEGMENTS:
+                        mot_state = "FULL_LOST (360 done)"
+                        mot_color = (140, 60, 60)
+                        stop_motors()
+                    else:
+                        elapsed = now - _scan_phase_start_t
+                        if _scan_phase == 'SETTLE':
+                            mot_state = f"SCAN look {_scan_segment_idx}/{SCAN_MAX_SEGMENTS}"
+                            mot_color = (255, 100, 255)
+                            stop_motors()
+                            if elapsed >= SCAN_SETTLE_S:
+                                _scan_phase = 'ROTATE'
+                                _scan_phase_start_t = now
+                        else:  # ROTATE
+                            mot_state = f"SCAN rot {_scan_segment_idx}/{SCAN_MAX_SEGMENTS} ({'L' if _scan_dir>0 else 'R'})"
+                            mot_color = (255, 100, 255)
+                            if elapsed < SCAN_ROT_S:
+                                duty = TURN_IN_PLACE_DTY * _scan_dir
+                                motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
+                            else:
+                                stop_motors()
+                                _scan_segment_idx += 1
+                                _scan_phase = 'SETTLE'
+                                _scan_phase_start_t = now
+        else:
+            ball_radius_px = min(last_ball[2], last_ball[3]) / 2.0
+            ball_dist_cm   = distance_cm(ball_radius_px)
+            ball_err_x     = last_ball[0] - fcx          # >0: ball right of center
+            # ball is back in view → reset lost / backup / scan timers
+            _lost_since_t = 0.0; _backup_started_t = 0.0
+            _scan_started_t = 0.0; _scan_segment_idx = 0
+            _scan_phase = 'SETTLE'; _scan_phase_start_t = 0.0
+
+            # Hysteresis: tight to commit to forward, loose to fall back to rotate
+            if chase_rotating:
+                centered = abs(ball_err_x) < BALL_CENTER_TIGHT
+            else:
+                centered = abs(ball_err_x) < BALL_CENTER_LOOSE
+            chase_rotating = not centered
+
+            # in_scoop needs TIGHTER centering than chase: ball must be at bot's mouth (frame center),
+            # not just within the loose chase tolerance. Otherwise AIM aligns to off-center ball.
+            in_scoop = ball_dist_cm <= SCOOP_DIST_CM and abs(ball_err_x) < SCOOP_CENTER_TOL
+            # Goal info: prefer current frame UNCLIPPED; if live is clipped or missing, fall back to memory.
+            # Clipped live frames have a biased center, so trust the last unclipped read instead.
+            goal_seen_now = best_goal is not None and not best_goal_clipped
+            if goal_seen_now:
+                goal_x  = float(best_goal[0])
+                goal_w_px = int(best_goal[2])
+                goal_known = True
+            else:
+                # extend goal memory window if we just came out of SCAN — the goal_x in
+                # camera frame is meaningless during body rotation, but if SCAN found the
+                # ball quickly (before completing a full sweep), we still want to use the
+                # last unclipped goal_x rather than wait for the goal to re-enter FOV.
+                _goal_mem_window = SCAN_GOAL_MEMORY_S if _scan_started_t > 0 else 4.0
+                if _last_goal_x is not None and (time.time() - _last_goal_seen_t) < _goal_mem_window:
+                    goal_x = _last_goal_x
+                    goal_w_px = _last_goal_w
+                    goal_known = True
+                else:
+                    goal_x = 0.0; goal_w_px = 0; goal_known = False
+            aim_err   = (last_ball[0] - goal_x) if goal_known else 0.0
+            aimed     = goal_known and abs(aim_err) < AIM_TOL_PX
+            goal_close = goal_known and goal_w_px > GOAL_CLOSE_W_PX
+
+            # 4-tier distance speed profile (zhui's proven values)
+            if   ball_dist_cm <= 12: chase_lin = 0.78
+            elif ball_dist_cm <= 25: chase_lin = 0.88
+            elif ball_dist_cm <= 45: chase_lin = 0.78
+            else:                    chase_lin = 0.78
+            if abs(ball_err_x) > SLOWDOWN_ERR_PX:
+                chase_lin *= 0.7
+
+            # Goal is back in view → reset HOLD-SCAN counters so a future ball-in-scoop-no-goal
+            # event starts fresh instead of resuming mid-sweep.
+            if goal_known:
+                _hold_scan_started_t = 0.0
+                _hold_scan_segment_idx = 0
+                _hold_scan_phase = 'SETTLE'
+
+            if in_scoop and aimed and goal_close:
+                # Bot is at goal — ball is essentially scored, don't ram the post.
+                mot_state = "AT_GOAL"; mot_color = (0, 220, 0)
+                stop_motors()
+            elif in_scoop and aimed:
+                if mot_state != "SCORE":
+                    score_started_t = time.time()
+                if time.time() - score_started_t < SCORE_DURATION_S:
+                    mot_state = "SCORE"; mot_color = (0, 255, 0)
+                    drive(1.0, 0.0)
+                else:
+                    mot_state = "SCORE_DONE"; mot_color = (0, 200, 0)
+                    stop_motors()
+            elif in_scoop and goal_known:
+                # Curving AIM: drive forward while rotating. Pure in-place rotation can't
+                # swing the goal across frame fast enough when ball is in scoop (ball moves
+                # with bot). Forward motion changes geometry so rotation actually converges.
+                mot_state = "AIM (curve)"
+                mot_color = (0, 255, 255)
+                reset_body_rot_phase(); reset_fwd_phase()
+                # aim_err > 0: ball right of goal → rotate left (+1) to swing ball toward goal
+                direction = +1 if aim_err > 0 else -1
+                drive(AIM_DRIVE_LIN, AIM_DRIVE_ANG * direction)
+            elif in_scoop:
+                # Ball in scoop but no goal visible. Rotate in place ~45° to look for goal,
+                # settle, repeat. Ball stays in scoop while rotating.
+                if _hold_scan_started_t == 0.0:
+                    _hold_scan_started_t = time.time()
+                    _hold_scan_phase_start_t = time.time()
+                    _hold_scan_phase = 'SETTLE'
+                    _hold_scan_segment_idx = 0
+                    # bias rotation toward last-known goal direction (if any), else default left
+                    if _last_goal_x is not None:
+                        _hold_scan_dir = +1 if _last_goal_x < fcx else -1
+                    else:
+                        _hold_scan_dir = +1
+                hold_lost_for = time.time() - _hold_scan_started_t
+                if hold_lost_for < HOLD_SCAN_AFTER_S:
+                    # short pause before rotating — give YOLO chance to see goal first
+                    mot_state = "HOLD"; mot_color = (255, 200, 0)
+                    reset_body_rot_phase(); reset_fwd_phase()
+                    stop_motors()
+                elif _hold_scan_segment_idx >= HOLD_SCAN_MAX_SEGS:
+                    # full sweep done, no goal found — sit
+                    mot_state = "HOLD (no goal 360)"; mot_color = (180, 100, 100)
+                    stop_motors()
+                else:
+                    elapsed = time.time() - _hold_scan_phase_start_t
+                    if _hold_scan_phase == 'SETTLE':
+                        mot_state = f"HOLD look {_hold_scan_segment_idx}/{HOLD_SCAN_MAX_SEGS}"
+                        mot_color = (255, 200, 0)
+                        stop_motors()
+                        if elapsed >= HOLD_SCAN_SETTLE_S:
+                            _hold_scan_phase = 'ROTATE'
+                            _hold_scan_phase_start_t = time.time()
+                    else:
+                        mot_state = f"HOLD rot {_hold_scan_segment_idx}/{HOLD_SCAN_MAX_SEGS} ({'L' if _hold_scan_dir>0 else 'R'})"
+                        mot_color = (255, 200, 0)
+                        if elapsed < HOLD_SCAN_ROT_S:
+                            duty = TURN_IN_PLACE_DTY * _hold_scan_dir
+                            motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
+                        else:
+                            stop_motors()
+                            _hold_scan_segment_idx += 1
+                            _hold_scan_phase = 'SETTLE'
+                            _hold_scan_phase_start_t = time.time()
+            elif centered:
+                mot_state = f"CHASE_FWD ({_fwd_phase.lower()})"
+                mot_color = (255, 200, 0)
+                reset_body_rot_phase()
+                # Curving chase: small angular proportional to ball offset so bot leans toward ball
+                # while driving forward, instead of straight forward and rotating separately.
+                chase_ang = float(np.clip(-ball_err_x / 600.0, -0.5, 0.5))
+                chase_fwd_pulsed(chase_lin, chase_ang)
+            else:
+                mot_state = f"CHASE_ROT ({_body_rot_phase.lower()})"
+                mot_color = (255, 200, 0)
+                reset_fwd_phase()
+                # ball_err_x > 0 (right of center) → rotate body RIGHT (CW = -1)
+                direction = -1 if ball_err_x > 0 else +1
+                body_rot_pulsed(direction)
+
+        # ----- aim line: ball -> goal -----
+        if best_ball is not None and best_goal is not None:
+            cv2.line(frame,
+                     (int(best_ball[0]), int(best_ball[1])),
+                     (int(best_goal[0]), int(best_goal[1])),
+                     (0, 255, 255), 1)
+
+        # ----- crosshair (camera frame center, since camera is locked) -----
+        cv2.line(frame, (fcx, 0), (fcx, frame.shape[0]), (40, 40, 200), 1)
+        cv2.line(frame, (fcx-25, fcy), (fcx+25, fcy), (0, 0, 255), 2)
+        cv2.line(frame, (fcx, fcy-25), (fcx, fcy+25), (0, 0, 255), 2)
+        # ----- scoop tolerance band (shows where ball must be to trigger AIM) -----
+        cv2.line(frame, (fcx-SCOOP_CENTER_TOL, 0), (fcx-SCOOP_CENTER_TOL, frame.shape[0]), (0, 200, 200), 1)
+        cv2.line(frame, (fcx+SCOOP_CENTER_TOL, 0), (fcx+SCOOP_CENTER_TOL, frame.shape[0]), (0, 200, 200), 1)
+
+        # ----- FPS / overlay -----
+        frames += 1
+        if frames >= 5:
+            fps_acc = frames / (time.time() - t_last)
+            t_last, frames = time.time(), 0
+
+        thr = state_pub["throttled"]
+        thr_color = (0, 255, 0) if thr == "0x0" else (0, 0, 255)
+        ball_x = int(last_ball[0]) if last_ball else 0
+        if best_goal is not None and not best_goal_clipped:
+            goal_x_o = int(best_goal[0])
+            goal_w_o = int(best_goal[2])
+            goal_label = "live"
+        elif _last_goal_x is not None and (time.time() - _last_goal_seen_t) < 4.0:
+            goal_x_o = int(_last_goal_x)
+            goal_w_o = int(_last_goal_w)
+            goal_label = f"mem {time.time()-_last_goal_seen_t:.1f}s" + (" (clipped)" if best_goal is not None else "")
+        else:
+            goal_x_o = 0
+            goal_w_o = 0
+            goal_label = "none"
+        if last_ball is not None:
+            r_px = min(last_ball[2], last_ball[3]) / 2.0
+            dist_str = f"{distance_cm(r_px):5.1f} cm  (r={int(r_px)}px)"
+        else:
+            dist_str = "—"
+        motors_label = "OFF" if NO_MOTORS else "ON"
+        cam_tilt_now = CAM_TILT_CLOSE if _cam_state == "CLOSE" else CAM_TILT_FAR
+        lines = [
+            (f"BODY: {mot_state}  |  motors: {motors_label}",                mot_color),
+            (f"FPS: {fps_acc:5.1f}  infer: {infer_ms:5.1f}ms",               (255, 255, 255)),
+            (f"ball: {n_ball} (x={ball_x})  dist: {dist_str}",               (0, 255, 200)),
+            (f"goal: {goal_label} (x={goal_x_o}, w={goal_w_o}px)",           (255, 255, 255)),
+            (f"camera {_cam_state}  pan={CAM_PAN_FIXED} tilt={cam_tilt_now}",(180, 180, 180)),
+            (f"temp: {state_pub['temp']}  volts: {state_pub['volts']}",      (255, 255, 255)),
+            (f"throttled: {thr}",                                            thr_color),
+        ]
+        y = 25
+        for line, color in lines:
+            cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 4)
+            cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+            y += 22
+
+        with lock:
+            state_pub["frame"] = frame
+            state_pub["frame_id"] += 1
+            state_pub["fps"]   = fps_acc
+
+finally:
+    state_pub["running"] = False
+    try: stop_motors()
+    except Exception: pass
+    try: servo_write([[1, 1500], [2, 1500]], 0.5)
+    except Exception: pass
     cap.release()
-    stop_motors()
-    servo_write([[1, 1800], [2, 1500]], 0.5)
-    print("[main] done", flush=True)
-
-if __name__ == '__main__':
-    main()
+    print("done")
