@@ -30,12 +30,12 @@ MODEL_PATH    = "/home/pi/best_ncnn_model"
 CAM_INDEX     = 0
 WIDTH, HEIGHT = 640, 480
 STREAM_PORT   = 8888
-CONF          = 0.35    # lowered to catch goalpost detections at distance (model is conservative on goal class)
+CONF          = 0.45    # slightly relaxed: model is very confident (0.97+) on clean balls; catches partial-occlusion frames
 
 # Camera positions — dynamic tilt: FAR for chase+goal sighting, CLOSE for confirming ball in scoop
 CAM_PAN_FIXED  = 1596     # calibrated — pan stays locked
 CAM_TILT_FAR   = 1770     # default — sees ball + goal (tuned 2026-05-04)
-CAM_TILT_CLOSE = 1770     # locked to FAR — looking down loses the upright goalpost from frame
+CAM_TILT_CLOSE = 1820     # used when ball within scoop range — looks down so ball stays in frame
 CAM_TILT_FIXED = CAM_TILT_FAR  # back-compat for overlay/init
 TILT_NEAR_CM   = 22.0     # at FAR: switch to CLOSE when ball ≤ this
 TILT_FAR_CM    = 38.0     # at CLOSE: switch back to FAR when ball > this (or ball lost)
@@ -78,35 +78,6 @@ SCORE_DURATION_S  = 0.9    # longer push so ball actually goes INTO goal mouth (
 SLOWDOWN_ERR_PX   = 250    # disabled in practice: bot transitions to CHASE_ROT at LOOSE=220 before this fires
 AIM_DRIVE_LIN     = 0.55   # need higher than chase since FWD_DUTY=28 means 0.55*28=15.4 (one side ~32% — breaks stiction)
 AIM_DRIVE_ANG     = 0.95   # paired with above to keep one side ~zero, other side ~32% (clean pivot+forward)
-
-# ============ Ball recovery / back-up ============
-# When the bot loses sight of the ball (e.g. drove past it / overshot), it FIRST stops and
-# waits briefly — sometimes YOLO just missed a frame or two. If the ball is still missing
-# after BACKUP_AFTER_LOST_S seconds, the bot drives slowly in REVERSE (camera stays locked
-# forward) so the ball comes back into the camera's view in front of the bot. Reverse stops
-# as soon as the ball is re-detected. Gives up after BACKUP_TIMEOUT_S.
-BACKUP_AFTER_LOST_S = 1.5    # seconds in WAIT before reverse kicks in
-BACKUP_TIMEOUT_S    = 4.0    # give up reversing after this long; sit in WAIT
-BACKUP_LIN          = -0.55  # reverse speed (matches AIM_DRIVE_LIN magnitude — gentle but breaks stiction)
-
-# ============ SCAN-360 (long-range ball search) ============
-# After BACKUP gives up and the bot has been totally still for SCAN_AFTER_LOST_S,
-# rotate ~45° in place, then SETTLE looking for the ball, repeat up to 8 times for
-# a full 360° sweep. First rotation is biased toward last-known goal direction so
-# the bot covers the play area before sweeping into open space.
-SCAN_AFTER_LOST_S   = 10.0   # seconds after ball loss before SCAN starts (covers 5.5s of WAIT/BACKUP + 4.5s pause)
-SCAN_SETTLE_S       = 4.5    # seconds to sit still between rotations watching for ball
-SCAN_ROT_S          = 0.75   # ~45° continuous rotation @ TURN_IN_PLACE_DTY=26 on carpet (calibrate live)
-SCAN_MAX_SEGMENTS   = 16     # 16 × 45° = 720° (two full sweeps) before giving up
-SCAN_GOAL_MEMORY_S  = 90.0   # extend goal memory while scanning (default is 4s) so AIM still works after ball reacquired
-
-# ============ HOLD-SCAN (goal search while carrying ball) ============
-# When bot has ball in scoop but goal isn't visible, rotate in place ~45° increments
-# (ball stays in the scoop while rotating) until goal is seen → AIM/SCORE.
-HOLD_SCAN_AFTER_S    = 2.0   # seconds of HOLD without goal before rotation kicks in
-HOLD_SCAN_SETTLE_S   = 3.0   # seconds to sit still between rotations watching for goal
-HOLD_SCAN_ROT_S      = 0.55  # ~45° continuous rotation while holding ball
-HOLD_SCAN_MAX_SEGS   = 8     # 8 × 45° = 360° before giving up
 
 # ============ Serial / CRC8 ============
 CRC8 = [
@@ -228,7 +199,6 @@ def reset_fwd_phase():
     _fwd_phase = 'STOP'
     _fwd_phase_start = time.time()
 
-
 # ============ camera + model ============
 print(f"loading model: {MODEL_PATH}")
 model = YOLO(MODEL_PATH, task="detect")
@@ -258,21 +228,6 @@ print(f"[motors] {'DISARMED' if NO_MOTORS else 'ARMED'}")
 
 # ============ stability state ============
 last_ball       = None    # (cx, cy, w, h) smoothed + persistent
-_lost_since_t   = 0.0     # time we entered WAIT (used to decide when BACKUP kicks in)
-_backup_started_t = 0.0   # time BACKUP mode actually started (for BACKUP_TIMEOUT_S)
-# SCAN-360 state (for ball loss)
-_scan_started_t      = 0.0   # time SCAN first entered (resets on ball reacquire)
-_scan_segment_idx    = 0     # 0..SCAN_MAX_SEGMENTS; FULL_LOST when >= 8
-_scan_phase_start_t  = 0.0   # time current ROTATE/SETTLE phase began
-_scan_phase          = 'SETTLE'  # 'ROTATE' | 'SETTLE' — start in SETTLE so we look first
-_scan_dir            = +1    # set on entry from last goal_x sign
-
-# HOLD-SCAN state (for goal search while ball is in scoop)
-_hold_scan_started_t   = 0.0
-_hold_scan_segment_idx = 0
-_hold_scan_phase_start_t = 0.0
-_hold_scan_phase       = 'SETTLE'
-_hold_scan_dir         = +1
 ball_smooth     = None    # (cx, cy)
 ball_persist    = 0
 ball_ttl        = 0
@@ -500,87 +455,14 @@ try:
             reset_body_rot_phase(); reset_fwd_phase()
             stop_motors()
         elif not ball_actionable:
-            now = time.time()
-            if last_ball is not None:
-                # ball seen recently but persistence not yet built — wait for it to settle
-                mot_state = "WARMUP"
-                mot_color = (200, 200, 0)
-                reset_body_rot_phase(); reset_fwd_phase()
-                stop_motors()
-                _lost_since_t = 0.0; _backup_started_t = 0.0
-            else:
-                # ball completely lost. Brief WAIT, then drive in REVERSE so the ball
-                # comes back into the camera's view (camera is locked forward; if we
-                # overshot the ball it's now behind us).
-                if _lost_since_t == 0.0:
-                    _lost_since_t = now
-                lost_for = now - _lost_since_t
-                if lost_for < BACKUP_AFTER_LOST_S:
-                    # short pause — sometimes YOLO just dropped a frame, don't reverse instantly
-                    mot_state = "WAIT"
-                    mot_color = (200, 200, 0)
-                    reset_body_rot_phase(); reset_fwd_phase()
-                    stop_motors()
-                elif lost_for < SCAN_AFTER_LOST_S:
-                    # within BACKUP window or short pause after BACKUP timed out
-                    if _backup_started_t == 0.0:
-                        _backup_started_t = now
-                    if (now - _backup_started_t) > BACKUP_TIMEOUT_S:
-                        # BACKUP gave up — quiet pause until SCAN_AFTER_LOST_S
-                        mot_state = "WAIT (gave up)"
-                        mot_color = (180, 100, 100)
-                        reset_body_rot_phase(); reset_fwd_phase()
-                        stop_motors()
-                    else:
-                        mot_state = f"BACKUP ({_fwd_phase.lower()})"
-                        mot_color = (0, 200, 255)
-                        reset_body_rot_phase()
-                        chase_fwd_pulsed(BACKUP_LIN, 0.0)   # negative lin = reverse
-                else:
-                    # SCAN-360: rotate ~45° then look ~10s, repeat for full circle
-                    if _scan_started_t == 0.0:
-                        _scan_started_t = now
-                        _scan_phase_start_t = now
-                        _scan_phase = 'SETTLE'
-                        _scan_segment_idx = 0
-                        # bias direction toward last known goal — rotate toward where action was
-                        if _last_goal_x is not None:
-                            _scan_dir = +1 if _last_goal_x < fcx else -1
-                        else:
-                            _scan_dir = +1
-                        reset_body_rot_phase(); reset_fwd_phase()
-                    if _scan_segment_idx >= SCAN_MAX_SEGMENTS:
-                        mot_state = "FULL_LOST (360 done)"
-                        mot_color = (140, 60, 60)
-                        stop_motors()
-                    else:
-                        elapsed = now - _scan_phase_start_t
-                        if _scan_phase == 'SETTLE':
-                            mot_state = f"SCAN look {_scan_segment_idx}/{SCAN_MAX_SEGMENTS}"
-                            mot_color = (255, 100, 255)
-                            stop_motors()
-                            if elapsed >= SCAN_SETTLE_S:
-                                _scan_phase = 'ROTATE'
-                                _scan_phase_start_t = now
-                        else:  # ROTATE
-                            mot_state = f"SCAN rot {_scan_segment_idx}/{SCAN_MAX_SEGMENTS} ({'L' if _scan_dir>0 else 'R'})"
-                            mot_color = (255, 100, 255)
-                            if elapsed < SCAN_ROT_S:
-                                duty = TURN_IN_PLACE_DTY * _scan_dir
-                                motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
-                            else:
-                                stop_motors()
-                                _scan_segment_idx += 1
-                                _scan_phase = 'SETTLE'
-                                _scan_phase_start_t = now
+            mot_state = "WAIT" if last_ball is None else "WARMUP"
+            mot_color = (200, 200, 0)
+            reset_body_rot_phase()
+            stop_motors()
         else:
             ball_radius_px = min(last_ball[2], last_ball[3]) / 2.0
             ball_dist_cm   = distance_cm(ball_radius_px)
             ball_err_x     = last_ball[0] - fcx          # >0: ball right of center
-            # ball is back in view → reset lost / backup / scan timers
-            _lost_since_t = 0.0; _backup_started_t = 0.0
-            _scan_started_t = 0.0; _scan_segment_idx = 0
-            _scan_phase = 'SETTLE'; _scan_phase_start_t = 0.0
 
             # Hysteresis: tight to commit to forward, loose to fall back to rotate
             if chase_rotating:
@@ -599,18 +481,14 @@ try:
                 goal_x  = float(best_goal[0])
                 goal_w_px = int(best_goal[2])
                 goal_known = True
+            elif _last_goal_x is not None and (time.time() - _last_goal_seen_t) < 4.0:
+                goal_x = _last_goal_x
+                goal_w_px = _last_goal_w
+                goal_known = True
             else:
-                # extend goal memory window if we just came out of SCAN — the goal_x in
-                # camera frame is meaningless during body rotation, but if SCAN found the
-                # ball quickly (before completing a full sweep), we still want to use the
-                # last unclipped goal_x rather than wait for the goal to re-enter FOV.
-                _goal_mem_window = SCAN_GOAL_MEMORY_S if _scan_started_t > 0 else 4.0
-                if _last_goal_x is not None and (time.time() - _last_goal_seen_t) < _goal_mem_window:
-                    goal_x = _last_goal_x
-                    goal_w_px = _last_goal_w
-                    goal_known = True
-                else:
-                    goal_x = 0.0; goal_w_px = 0; goal_known = False
+                goal_x = 0.0
+                goal_w_px = 0
+                goal_known = False
             aim_err   = (last_ball[0] - goal_x) if goal_known else 0.0
             aimed     = goal_known and abs(aim_err) < AIM_TOL_PX
             goal_close = goal_known and goal_w_px > GOAL_CLOSE_W_PX
@@ -622,13 +500,6 @@ try:
             else:                    chase_lin = 0.78
             if abs(ball_err_x) > SLOWDOWN_ERR_PX:
                 chase_lin *= 0.7
-
-            # Goal is back in view → reset HOLD-SCAN counters so a future ball-in-scoop-no-goal
-            # event starts fresh instead of resuming mid-sweep.
-            if goal_known:
-                _hold_scan_started_t = 0.0
-                _hold_scan_segment_idx = 0
-                _hold_scan_phase = 'SETTLE'
 
             if in_scoop and aimed and goal_close:
                 # Bot is at goal — ball is essentially scored, don't ram the post.
@@ -654,48 +525,8 @@ try:
                 direction = +1 if aim_err > 0 else -1
                 drive(AIM_DRIVE_LIN, AIM_DRIVE_ANG * direction)
             elif in_scoop:
-                # Ball in scoop but no goal visible. Rotate in place ~45° to look for goal,
-                # settle, repeat. Ball stays in scoop while rotating.
-                if _hold_scan_started_t == 0.0:
-                    _hold_scan_started_t = time.time()
-                    _hold_scan_phase_start_t = time.time()
-                    _hold_scan_phase = 'SETTLE'
-                    _hold_scan_segment_idx = 0
-                    # bias rotation toward last-known goal direction (if any), else default left
-                    if _last_goal_x is not None:
-                        _hold_scan_dir = +1 if _last_goal_x < fcx else -1
-                    else:
-                        _hold_scan_dir = +1
-                hold_lost_for = time.time() - _hold_scan_started_t
-                if hold_lost_for < HOLD_SCAN_AFTER_S:
-                    # short pause before rotating — give YOLO chance to see goal first
-                    mot_state = "HOLD"; mot_color = (255, 200, 0)
-                    reset_body_rot_phase(); reset_fwd_phase()
-                    stop_motors()
-                elif _hold_scan_segment_idx >= HOLD_SCAN_MAX_SEGS:
-                    # full sweep done, no goal found — sit
-                    mot_state = "HOLD (no goal 360)"; mot_color = (180, 100, 100)
-                    stop_motors()
-                else:
-                    elapsed = time.time() - _hold_scan_phase_start_t
-                    if _hold_scan_phase == 'SETTLE':
-                        mot_state = f"HOLD look {_hold_scan_segment_idx}/{HOLD_SCAN_MAX_SEGS}"
-                        mot_color = (255, 200, 0)
-                        stop_motors()
-                        if elapsed >= HOLD_SCAN_SETTLE_S:
-                            _hold_scan_phase = 'ROTATE'
-                            _hold_scan_phase_start_t = time.time()
-                    else:
-                        mot_state = f"HOLD rot {_hold_scan_segment_idx}/{HOLD_SCAN_MAX_SEGS} ({'L' if _hold_scan_dir>0 else 'R'})"
-                        mot_color = (255, 200, 0)
-                        if elapsed < HOLD_SCAN_ROT_S:
-                            duty = TURN_IN_PLACE_DTY * _hold_scan_dir
-                            motor_duty([[1, duty], [2, duty], [3, duty], [4, duty]])
-                        else:
-                            stop_motors()
-                            _hold_scan_segment_idx += 1
-                            _hold_scan_phase = 'SETTLE'
-                            _hold_scan_phase_start_t = time.time()
+                mot_state = "HOLD"; mot_color = (255, 200, 0)
+                stop_motors()
             elif centered:
                 mot_state = f"CHASE_FWD ({_fwd_phase.lower()})"
                 mot_color = (255, 200, 0)

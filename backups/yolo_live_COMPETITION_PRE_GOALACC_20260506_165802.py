@@ -30,12 +30,12 @@ MODEL_PATH    = "/home/pi/best_ncnn_model"
 CAM_INDEX     = 0
 WIDTH, HEIGHT = 640, 480
 STREAM_PORT   = 8888
-CONF          = 0.35    # lowered to catch goalpost detections at distance (model is conservative on goal class)
+CONF          = 0.45    # slightly relaxed: model is very confident (0.97+) on clean balls; catches partial-occlusion frames
 
 # Camera positions — dynamic tilt: FAR for chase+goal sighting, CLOSE for confirming ball in scoop
 CAM_PAN_FIXED  = 1596     # calibrated — pan stays locked
 CAM_TILT_FAR   = 1770     # default — sees ball + goal (tuned 2026-05-04)
-CAM_TILT_CLOSE = 1770     # locked to FAR — looking down loses the upright goalpost from frame
+CAM_TILT_CLOSE = 1820     # used when ball within scoop range — looks down so ball stays in frame
 CAM_TILT_FIXED = CAM_TILT_FAR  # back-compat for overlay/init
 TILT_NEAR_CM   = 22.0     # at FAR: switch to CLOSE when ball ≤ this
 TILT_FAR_CM    = 38.0     # at CLOSE: switch back to FAR when ball > this (or ball lost)
